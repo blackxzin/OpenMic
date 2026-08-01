@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OpenMic
+Comment=Use your phone as a wireless microphone
+Exec=OpenMic
+Icon=openmic
+Categories=AudioVideo;Audio;
+Terminal=false

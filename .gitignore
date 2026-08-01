@@ -1,3 +1,16 @@
 desktop/.venv/
 __pycache__/
 *.pyc
+
+# PyInstaller/AppImage build output — build with packaging/build_appimage.sh
+desktop/build/
+desktop/dist/
+desktop/AppDir/
+desktop/squashfs-root/
+desktop/OpenMic.spec
+desktop/build-tools/
+
+# Android release signing — never commit these
+mobile/android/key.properties
+mobile/android/app/*.jks
+mobile/android/app/*.keystore

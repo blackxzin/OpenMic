@@ -1,5 +1,7 @@
 import asyncio
+import re
 import socket
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -24,22 +26,47 @@ from openmic.virtual_mic import VirtualMic, VirtualMicError
 DEFAULT_PORT = 45820
 
 
+_IP_ADDR_LINE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)")
+
+
 def get_local_ips() -> list[str]:
-    ips: set[str] = set()
+    """Local IPv4 addresses, WiFi interfaces first.
+
+    Picking "whichever interface handles outbound internet traffic" doesn't
+    work here: this machine's default route can go over a wired/USB interface
+    while the phone is only reachable over WiFi. Interface *names* are a much
+    more reliable signal than routing — Linux's predictable naming scheme
+    prefixes wireless interfaces with "wl" (wlp1s0, wlan0, ...), unlike wired/
+    USB-ethernet ("en...") or other interfaces.
+    """
+    by_iface: dict[str, str] = {}
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            ip = info[4][0]
-            if not ip.startswith("127.") and ":" not in ip:
-                ips.add(ip)
-    except socket.gaierror:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        for line in result.stdout.splitlines():
+            match = _IP_ADDR_LINE.match(line)
+            if match:
+                iface, ip = match.groups()
+                if not ip.startswith("127."):
+                    by_iface[iface] = ip
+    except (OSError, subprocess.SubprocessError):
         pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect(("8.8.8.8", 80))
-            ips.add(probe.getsockname()[0])
-    except OSError:
-        pass
-    return sorted(ips) or ["127.0.0.1"]
+
+    if not by_iface:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("8.8.8.8", 80))
+                return [probe.getsockname()[0]]
+        except OSError:
+            return ["127.0.0.1"]
+
+    wifi_ips = sorted(ip for iface, ip in by_iface.items() if iface.startswith("wl"))
+    other_ips = sorted(ip for iface, ip in by_iface.items() if not iface.startswith("wl"))
+    return wifi_ips + other_ips or ["127.0.0.1"]
 
 
 class ServerSignals(QObject):
@@ -107,8 +134,9 @@ class MainWindow(QWidget):
 
         ip_group = QGroupBox("Endereço deste computador")
         ip_layout = QVBoxLayout(ip_group)
-        for ip in self._local_ips:
-            ip_layout.addWidget(QLabel(ip))
+        for index, ip in enumerate(self._local_ips):
+            label = f"{ip} (usar este)" if index == 0 else ip
+            ip_layout.addWidget(QLabel(label))
         layout.addWidget(ip_group)
 
         port_row = QHBoxLayout()
