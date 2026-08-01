@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openmic.discovery import ServiceAdvertiser
 from openmic.server import AudioBridge, run_server
 from openmic.virtual_mic import VirtualMic, VirtualMicError
 
@@ -93,7 +94,9 @@ class MainWindow(QWidget):
 
         self._virtual_mic = VirtualMic()
         self._bridge = AudioBridge(sink_device_name="OpenMicSink")
+        self._advertiser = ServiceAdvertiser()
         self._server_thread: Optional[ServerThread] = None
+        self._local_ips = get_local_ips()
 
         self._signals = ServerSignals()
         self._signals.log_message.connect(self._append_log)
@@ -104,7 +107,7 @@ class MainWindow(QWidget):
 
         ip_group = QGroupBox("Endereço deste computador")
         ip_layout = QVBoxLayout(ip_group)
-        for ip in get_local_ips():
+        for ip in self._local_ips:
             ip_layout.addWidget(QLabel(ip))
         layout.addWidget(ip_group)
 
@@ -150,6 +153,10 @@ class MainWindow(QWidget):
         self._server_thread = ServerThread("0.0.0.0", port, self._bridge, self._signals)
         self._server_thread.start()
 
+        if self._local_ips:
+            self._advertiser.start(port=port, ip=self._local_ips[0])
+            self._append_log("Anunciando na rede via mDNS (descoberta automática)")
+
         self._toggle_button.setText("Parar servidor")
         self._status_label.setText("Aguardando conexão do celular...")
 
@@ -158,6 +165,7 @@ class MainWindow(QWidget):
             self._server_thread.stop()
             self._server_thread.join(timeout=2)
             self._server_thread = None
+        self._advertiser.stop()
         self._bridge.stop_output()
         self._virtual_mic.destroy()
         self._toggle_button.setText("Iniciar servidor")

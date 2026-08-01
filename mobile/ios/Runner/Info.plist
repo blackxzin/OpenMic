@@ -28,6 +28,12 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OpenMic precisa do microfone para transmiti-lo como entrada de áudio para o computador.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OpenMic procura computadores na sua rede local para se conectar como microfone.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_openmic._udp.</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

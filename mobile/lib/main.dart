@@ -2,10 +2,13 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
 import 'package:record/record.dart';
 
 import 'protocol.dart';
+
+const _serviceType = '_openmic._udp';
 
 void main() {
   runApp(const OpenMicApp());
@@ -47,9 +50,48 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   ConnectionStatus _status = ConnectionStatus.disconnected;
   String? _errorMessage;
 
+  BonsoirDiscovery? _discovery;
+  StreamSubscription<BonsoirDiscoveryEvent>? _discoverySubscription;
+  final Map<String, BonsoirService> _foundDevices = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _startDiscovery();
+  }
+
+  Future<void> _startDiscovery() async {
+    final discovery = BonsoirDiscovery(type: _serviceType);
+    _discovery = discovery;
+    await discovery.initialize();
+    _discoverySubscription = discovery.eventStream?.listen((event) {
+      switch (event) {
+        case BonsoirDiscoveryServiceFoundEvent():
+          event.service.resolve(discovery.serviceResolver);
+        case BonsoirDiscoveryServiceResolvedEvent():
+          setState(() => _foundDevices[event.service.name] = event.service);
+        case BonsoirDiscoveryServiceLostEvent():
+          setState(() => _foundDevices.remove(event.service.name));
+        default:
+          break;
+      }
+    });
+    await discovery.start();
+  }
+
+  void _connectToDiscovered(BonsoirService service) {
+    final host = service.hostAddress;
+    if (host == null) return;
+    _ipController.text = host;
+    _portController.text = service.port.toString();
+    _connect();
+  }
+
   @override
   void dispose() {
     _disconnect();
+    _discoverySubscription?.cancel();
+    _discovery?.stop();
     _ipController.dispose();
     _portController.dispose();
     _recorder.dispose();
@@ -158,6 +200,33 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            const Text('Computadores encontrados na rede'),
+            const SizedBox(height: 8),
+            if (_foundDevices.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text(
+                  'Procurando... verifique se o app do computador está aberto e com o servidor iniciado.',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              )
+            else
+              ..._foundDevices.values.map(
+                (service) => Card(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  child: ListTile(
+                    leading: const Icon(Icons.computer),
+                    title: Text(service.name),
+                    subtitle: Text('${service.hostAddress}:${service.port}'),
+                    onTap: (isStreaming || isBusy)
+                        ? null
+                        : () => _connectToDiscovered(service),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 16),
+            const Text('Ou digite o IP manualmente'),
+            const SizedBox(height: 8),
             const Text('IP do computador (Linux)'),
             const SizedBox(height: 8),
             TextField(
