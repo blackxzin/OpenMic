@@ -68,6 +68,12 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   // Opus encoder
   OpusFlutter? _opusEncoder;
 
+  // VU meter state
+  double _vuLevel = 0.0;  // 0.0 to 1.0
+  Timer? _vuUpdateTimer;
+  final List<int> _recentSamples = [];
+  static const int _vuSampleWindow = 50;  // number of chunks to average
+
   BonsoirDiscovery? _discovery;
   StreamSubscription<BonsoirDiscoveryEvent>? _discoverySubscription;
   final Map<String, BonsoirService> _foundDevices = {};
@@ -116,6 +122,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _portController.dispose();
     _recorder.dispose();
     _opusEncoder?.close();
+    _vuUpdateTimer?.cancel();
     super.dispose();
   }
 
@@ -435,6 +442,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     final address = _serverAddress;
     if (socket == null || address == null) return;
 
+    // Update VU meter
+    _updateVuLevel(pcmChunk);
+
     try {
       // Encode PCM to Opus
       final opusData = _opusEncoder!.encode(pcmChunk);
@@ -454,6 +464,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     final socket = _socket;
     final address = _serverAddress;
     if (socket == null || address == null) return;
+
+    // Update VU meter
+    _updateVuLevel(chunk);
+
     try {
       socket.send(Protocol.packAudio(_sequence, chunk), address, _serverPort);
       _sequence = (_sequence + 1) & 0xFFFFFFFF;
@@ -463,6 +477,43 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _handleConnectionLost();
       }
     }
+  }
+
+  void _updateVuLevel(Uint8List pcmChunk) {
+    // Calculate RMS (root mean square) of the audio chunk
+    // pcmChunk is int16 little-endian
+    if (pcmChunk.length < 2) return;
+
+    double sumSquares = 0.0;
+    final int sampleCount = pcmChunk.length ~/ 2;
+    for (int i = 0; i < pcmChunk.length; i += 2) {
+      // Convert two bytes to int16 (little-endian)
+      final int sample = (pcmChunk[i] | (pcmChunk[i + 1] << 8));
+      // Normalize to -1.0 to 1.0
+      final double normalized = sample / 32768.0;
+      sumSquares += normalized * normalized;
+    }
+    final double rms = sampleCount > 0 ? (sumSquares / sampleCount) : 0.0;
+    final double level = rms.clamp(0.0, 1.0);
+
+    // Smooth the level with exponential moving average
+    _recentSamples.add((level * 1000).round());
+    if (_recentSamples.length > _vuSampleWindow) {
+      _recentSamples.removeAt(0);
+    }
+    final double avgLevel = _recentSamples.isNotEmpty
+        ? _recentSamples.reduce((a, b) => a + b) / _recentSamples.length / 1000.0
+        : 0.0;
+
+    // Update UI at ~30fps
+    if (_vuUpdateTimer?.isActive ?? false) return;
+    _vuUpdateTimer = Timer(const Duration(milliseconds: 33), () {
+      if (mounted) {
+        setState(() {
+          _vuLevel = avgLevel;
+        });
+      }
+    });
   }
 
   Future<void> _handleConnectionLost() async {
@@ -617,6 +668,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
                     : (isStreaming ? 'Desconectar' : 'Conectar'),
               ),
             ),
+            if (isStreaming) ...[
+              const SizedBox(height: 24),
+              _VuMeter(level: _vuLevel),
+            ],
             const SizedBox(height: 24),
             _StatusBadge(status: _status, errorMessage: _errorMessage),
           ],
@@ -671,6 +726,92 @@ class _StatusBadge extends StatelessWidget {
         Icon(Icons.circle, size: 12, color: color),
         const SizedBox(width: 8),
         Expanded(child: Text(label)),
+      ],
+    );
+  }
+}
+
+class _VuMeter extends StatelessWidget {
+  const _VuMeter({required this.level});
+
+  final double level; // 0.0 to 1.0
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    // Determine color based on level
+    Color barColor;
+    if (level < 0.5) {
+      barColor = colorScheme.primary;
+    } else if (level < 0.8) {
+      barColor = Colors.amber;
+    } else {
+      barColor = Colors.red;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.graphic_eq, size: 18, color: colorScheme.primary),
+            const SizedBox(width: 8),
+            Text(
+              'Nível de áudio',
+              style: theme.textTheme.titleSmall,
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Container(
+          height: 20,
+          decoration: BoxDecoration(
+            border: Border.all(color: colorScheme.outline),
+            borderRadius: BorderRadius.circular(4),
+            color: colorScheme.surfaceContainerHighest,
+          ),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final barWidth = (constraints.maxWidth * level).clamp(0.0, constraints.maxWidth);
+              return Stack(
+                children: [
+                  // Background track
+                  Container(
+                    width: constraints.maxWidth,
+                    height: 20,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(4),
+                      color: colorScheme.surfaceContainerHighest,
+                    ),
+                  ),
+                  // Level bar
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 33),
+                    width: barWidth,
+                    height: 20,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(4),
+                      color: barColor,
+                    ),
+                  ),
+                  // Peak marker
+                  if (level > 0)
+                    Positioned(
+                      left: barWidth - 2,
+                      top: 0,
+                      bottom: 0,
+                      child: Container(
+                        width: 4,
+                        color: Colors.white.withValues(alpha: 0.7),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
       ],
     );
   }
