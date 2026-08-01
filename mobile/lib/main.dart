@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
+import 'package:opus_flutter/opus_flutter.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -64,6 +65,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   Uint8List? _authToken;
   bool _showPairingDialog = false;
 
+  // Opus encoder
+  OpusFlutter? _opusEncoder;
+
   BonsoirDiscovery? _discovery;
   StreamSubscription<BonsoirDiscoveryEvent>? _discoverySubscription;
   final Map<String, BonsoirService> _foundDevices = {};
@@ -73,6 +77,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     super.initState();
     _startDiscovery();
     _loadStoredCredentials();
+    _initOpusEncoder();
   }
 
   Future<void> _startDiscovery() async {
@@ -110,7 +115,26 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _ipController.dispose();
     _portController.dispose();
     _recorder.dispose();
+    _opusEncoder?.close();
     super.dispose();
+  }
+
+  Future<void> _initOpusEncoder() async {
+    try {
+      _opusEncoder = await OpusFlutter.create(
+        sampleRate: Protocol.sampleRate,
+        channels: Protocol.channels,
+        bitrate: Protocol.opusBitrate,
+        frameSize: Protocol.opusFrameSamples,
+      );
+      _opusEncoder?.setBitrate(Protocol.opusBitrate);
+    } catch (e) {
+      _logDebug('Opus encoder unavailable: $e');
+    }
+  }
+
+  void _logDebug(String msg) {
+    debugPrint('[OpenMic] $msg');
   }
 
   Future<void> _loadStoredCredentials() async {
@@ -343,6 +367,41 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
+    if (_opusEncoder == null) {
+      _logDebug('Opus encoder not available, falling back to PCM');
+      _startPcmStreaming();
+      return;
+    }
+
+    final audioStream = _recorder.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: Protocol.sampleRate,
+        numChannels: Protocol.channels,
+      ),
+    );
+    audioStream.then((stream) {
+      if (mounted) {
+        _audioSubscription = stream.listen(_onAudioChunkOpus);
+        setState(() {
+          _status = ConnectionStatus.streaming;
+        });
+      }
+    }).catchError((error) {
+      if (mounted) {
+        setState(() {
+          _status = ConnectionStatus.error;
+          _errorMessage = error.toString();
+        });
+        _disconnect();
+        if (!_userInitiatedDisconnect) {
+          _scheduleReconnect();
+        }
+      }
+    });
+  }
+
+  void _startPcmStreaming() {
     final audioStream = _recorder.startStream(
       const RecordConfig(
         encoder: AudioEncoder.pcm16bits,
@@ -369,6 +428,26 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         }
       }
     });
+  }
+
+  void _onAudioChunkOpus(Uint8List pcmChunk) {
+    final socket = _socket;
+    final address = _serverAddress;
+    if (socket == null || address == null) return;
+
+    try {
+      // Encode PCM to Opus
+      final opusData = _opusEncoder!.encode(pcmChunk);
+      if (opusData != null) {
+        socket.send(Protocol.packAudioOpus(_sequence, opusData), address, _serverPort);
+        _sequence = (_sequence + 1) & 0xFFFFFFFF;
+      }
+    } catch (e) {
+      // Socket error (e.g., network lost) — trigger reconnect
+      if (!_userInitiatedDisconnect && _status == ConnectionStatus.streaming) {
+        _handleConnectionLost();
+      }
+    }
   }
 
   void _onAudioChunk(Uint8List chunk) {

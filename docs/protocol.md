@@ -12,11 +12,30 @@ Every packet starts with a 1-byte type tag.
 | Type        | Value | Payload |
 |-------------|-------|---------|
 | `HELLO`     | 0x01  | v1 unpaired: `[0x01 0x01] + UTF-8 device name`<br>v1 paired: `[0x01 0x01] + device_id (16B) + auth_token (16B) + UTF-8 device name`<br>v0: UTF-8 device name (no version) |
-| `AUDIO`     | 0x02  | 4-byte big-endian sequence number + raw PCM16 mono samples |
+| `AUDIO`     | 0x02  | 4-byte big-endian sequence number + raw PCM16 mono samples (legacy) |
+| `AUDIO_OPUS`| 0x07  | 4-byte big-endian sequence number + Opus-encoded frame |
 | `BYE`       | 0x03  | (empty) |
 | `PAIR_CHAL` | 0x04  | 6-digit PIN (ASCII) |
 | `PAIR_RESP` | 0x05  | (empty) |
 | `PAIR_ACK`  | 0x06  | device_id (16B) + auth_token (16B) |
+
+## Opus audio encoding
+
+To reduce bandwidth from ~96 kB/s (raw PCM16) to ~10 kB/s, the protocol supports Opus encoding:
+
+- **Sample rate**: 48 kHz
+- **Channels**: 1 (mono)
+- **Bitrate**: 24 kbps (configured via `OPUS_BITRATE`)
+- **Frame size**: 20 ms (960 samples per frame)
+- **Application**: VoIP (optimized for voice)
+
+The mobile app uses `opus_flutter` to encode PCM16 chunks to Opus frames. The desktop uses
+`opuslib` (pyopus) to decode. If Opus is unavailable on either side, the app falls back
+to raw PCM (`AUDIO` packet type) automatically.
+
+The phone prefers Opus by default; if the desktop decoder is unavailable, the next
+connection attempt will fall back to PCM (or the desktop can signal preference via
+a future capability exchange).
 
 ## Pairing flow (v1)
 

@@ -8,6 +8,7 @@ from typing import Callable, Optional
 import sounddevice as sd
 
 from . import protocol
+from .opus_codec import OpusDecoder, _OPUS_AVAILABLE
 from .pairing import PairingStore, verify_pairing
 
 _log = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ class AudioBridge:
         self._sink_device_name = sink_device_name
         self._queue: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
         self._stream: Optional[sd.RawOutputStream] = None
+        self._opus_decoder: Optional[OpusDecoder] = None
 
     def start_output(self) -> None:
         # PortAudio caches its device list at init time, so a sink created after this
@@ -37,17 +39,32 @@ class AudioBridge:
         )
         self._stream.start()
 
-    def stop_output(self) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        if _OPUS_AVAILABLE:
+            self._opus_decoder = OpusDecoder()
+            _log.info("Opus decoder ready")
+        else:
+            _log.warning("Opus decoder unavailable — only raw PCM will work")
 
     def push_audio(self, pcm: bytes) -> None:
         try:
             self._queue.put_nowait(pcm)
         except queue.Full:
             pass  # falling behind: drop this chunk rather than build up latency
+
+    def push_opus(self, opus_data: bytes) -> None:
+        """Decode Opus frame and feed resulting PCM into the queue."""
+        if self._opus_decoder is None:
+            _log.debug("Opus frame received but decoder unavailable")
+            return
+        pcm = self._opus_decoder.decode(opus_data)
+        if pcm is not None:
+            self.push_audio(pcm)
+
+    def stop_output(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
     def _audio_callback(self, outdata, frames, time_info, status):
         needed = frames * protocol.SAMPLE_WIDTH * protocol.CHANNELS
@@ -100,6 +117,9 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         elif packet_type == protocol.AUDIO:
             _, pcm = payload
             self._bridge.push_audio(pcm)
+        elif packet_type == protocol.AUDIO_OPUS:
+            _, opus_data = payload
+            self._bridge.push_opus(opus_data)
         elif packet_type == protocol.BYE:
             if self._on_bye:
                 self._on_bye(addr)

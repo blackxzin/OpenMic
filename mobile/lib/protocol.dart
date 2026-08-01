@@ -5,16 +5,22 @@ import 'dart:typed_data';
 /// and docs/protocol.md for the full spec.
 class Protocol {
   static const int hello = 0x01;
-  static const int audio = 0x02;
+  static const int audio = 0x02;        // raw PCM16 (legacy)
   static const int bye = 0x03;
   static const int pairChal = 0x04;
   static const int pairResp = 0x05;
   static const int pairAck = 0x06;
+  static const int audioOpus = 0x07;    // Opus-encoded audio frame
 
   static const int version = 0x01;
 
   static const int sampleRate = 48000;
   static const int channels = 1;
+
+  // Opus settings (must match desktop)
+  static const int opusBitrate = 24000;
+  static const int opusFrameSizeMs = 20;
+  static const int opusFrameSamples = 960;  // 48000 * 20 / 1000
 
   static const int deviceIdLen = 16;
   static const int authTokenLen = 16;
@@ -54,6 +60,14 @@ class Protocol {
     packet[0] = audio;
     packet.buffer.asByteData().setUint32(1, sequence, Endian.big);
     packet.setRange(5, packet.length, pcm);
+    return packet;
+  }
+
+  static Uint8List packAudioOpus(int sequence, Uint8List opusData) {
+    final packet = Uint8List(5 + opusData.length);
+    packet[0] = audioOpus;
+    packet.buffer.asByteData().setUint32(1, sequence, Endian.big);
+    packet.setRange(5, packet.length, opusData);
     return packet;
   }
 

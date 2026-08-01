@@ -37,6 +37,7 @@ dependencies:
   record: ^7.1.1
   bonsoir: ^7.1.4
   shared_preferences: ^2.3.2
+  opus_flutter: ^1.1.0
 
 dev_dependencies:
   flutter_test:

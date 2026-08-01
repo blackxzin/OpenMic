@@ -2,7 +2,8 @@
 
 Single UDP socket, one byte packet type prefix:
   HELLO       -> announces a phone connecting, payload is the device name (UTF-8)
-  AUDIO       -> sequence number (4 bytes, big-endian) + raw PCM16 mono samples
+  AUDIO_PCM   -> sequence number (4 bytes, big-endian) + raw PCM16 mono samples
+  AUDIO_OPUS  -> sequence number (4 bytes, big-endian) + Opus-encoded frame
   BYE         -> phone disconnecting, no payload
   PAIR_CHAL   -> desktop -> phone: pairing challenge with PIN
   PAIR_RESP   -> phone -> desktop: user confirmed PIN
@@ -16,17 +17,23 @@ import secrets
 import struct
 
 HELLO = 0x01
-AUDIO = 0x02
+AUDIO = 0x02      # raw PCM16 (legacy)
 BYE = 0x03
 PAIR_CHAL = 0x04
 PAIR_RESP = 0x05
 PAIR_ACK = 0x06
+AUDIO_OPUS = 0x07  # Opus-encoded audio frame
 
 PROTOCOL_VERSION = 0x01
 
 SAMPLE_RATE = 48000
 CHANNELS = 1
 SAMPLE_WIDTH = 2  # 16-bit PCM
+
+# Opus encoding settings
+OPUS_BITRATE = 24000          # 24 kbps - voice quality, ~10x smaller than PCM
+OPUS_FRAME_SIZE_MS = 20       # 20ms frames
+OPUS_FRAME_SAMPLES = SAMPLE_RATE * OPUS_FRAME_SIZE_MS // 1000  # 960 samples per frame
 
 DEVICE_ID_LEN = 16
 AUTH_TOKEN_LEN = 16
@@ -56,6 +63,10 @@ def pack_hello_v0(device_name: str) -> bytes:
 
 def pack_audio(sequence: int, pcm: bytes) -> bytes:
     return bytes([AUDIO]) + _AUDIO_HEADER.pack(sequence) + pcm
+
+
+def pack_audio_opus(sequence: int, opus_data: bytes) -> bytes:
+    return bytes([AUDIO_OPUS]) + _AUDIO_HEADER.pack(sequence) + opus_data
 
 
 def pack_bye() -> bytes:
@@ -111,6 +122,9 @@ def unpack(packet: bytes):
     if packet_type == AUDIO:
         (sequence,) = _AUDIO_HEADER.unpack(packet[1:5])
         return AUDIO, (sequence, packet[5:])
+    if packet_type == AUDIO_OPUS:
+        (sequence,) = _AUDIO_HEADER.unpack(packet[1:5])
+        return AUDIO_OPUS, (sequence, packet[5:])
     if packet_type == BYE:
         return BYE, None
     if packet_type == PAIR_CHAL:
