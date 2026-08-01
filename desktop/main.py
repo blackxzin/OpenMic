@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -178,6 +179,24 @@ class MainWindow(QWidget):
         self._status_label = QLabel("Desligado")
         layout.addWidget(self._status_label)
 
+        # Volume/gain control
+        gain_group = QGroupBox("Ganho do microfone")
+        gain_layout = QVBoxLayout(gain_group)
+
+        self._gain_slider = QSlider(Qt.Horizontal)
+        self._gain_slider.setRange(0, 500)  # 0% to 500%
+        self._gain_slider.setValue(100)      # 100% = 1.0x
+        self._gain_slider.setTickPosition(QSlider.TicksBelow)
+        self._gain_slider.setTickInterval(50)
+        self._gain_slider.valueChanged.connect(self._on_gain_changed)
+        gain_layout.addWidget(self._gain_slider)
+
+        self._gain_label = QLabel("100%")
+        self._gain_label.setAlignment(Qt.AlignCenter)
+        gain_layout.addWidget(self._gain_label)
+
+        layout.addWidget(gain_group)
+
         # Paired devices section
         self._devices_group = QGroupBox("Dispositivos emparelhados")
         devices_layout = QVBoxLayout(self._devices_group)
@@ -266,6 +285,12 @@ class MainWindow(QWidget):
     def _on_pairing_request(self, ip: str, pin: str) -> None:
         self._status_label.setText(f"Emparelhar: {pin}")
         self._append_log(f"Solicitação de emparelhamento de {ip} — PIN: {pin}")
+
+    def _on_gain_changed(self, value: int) -> None:
+        # value is 0-500, represents percentage
+        gain = value / 100.0
+        self._bridge.gain = gain
+        self._gain_label.setText(f"{value}%")
 
     def _refresh_device_list(self) -> None:
         self._devices_list.clear()

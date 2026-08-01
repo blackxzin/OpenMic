@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import queue
+import threading
 from typing import Callable, Optional
 
 import sounddevice as sd
@@ -22,6 +23,8 @@ class AudioBridge:
         self._queue: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
         self._stream: Optional[sd.RawOutputStream] = None
         self._opus_decoder: Optional[OpusDecoder] = None
+        self._gain: float = 1.0
+        self._gain_lock = threading.Lock()
 
     def start_output(self) -> None:
         # PortAudio caches its device list at init time, so a sink created after this
@@ -45,6 +48,18 @@ class AudioBridge:
         else:
             _log.warning("Opus decoder unavailable — only raw PCM will work")
 
+    @property
+    def gain(self) -> float:
+        with self._gain_lock:
+            return self._gain
+
+    @gain.setter
+    def gain(self, value: float) -> None:
+        # Clamp between 0.0 and 5.0 (0% to 500%)
+        with self._gain_lock:
+            self._gain = max(0.0, min(5.0, value))
+        _log.debug("Gain set to %.2f", self._gain)
+
     def push_audio(self, pcm: bytes) -> None:
         try:
             self._queue.put_nowait(pcm)
@@ -66,6 +81,25 @@ class AudioBridge:
             self._stream.close()
             self._stream = None
 
+    def _apply_gain(self, data: bytes) -> bytes:
+        """Apply gain to int16 PCM data. Returns new bytes."""
+        if self._gain == 1.0:
+            return data
+        # Convert to int16 array, apply gain, convert back
+        import array
+        samples = array.array('h', data)
+        with self._gain_lock:
+            gain = self._gain
+        for i in range(len(samples)):
+            val = int(samples[i] * gain)
+            # Clamp to int16 range
+            if val > 32767:
+                val = 32767
+            elif val < -32768:
+                val = -32768
+            samples[i] = val
+        return samples.tobytes()
+
     def _audio_callback(self, outdata, frames, time_info, status):
         needed = frames * protocol.SAMPLE_WIDTH * protocol.CHANNELS
         try:
@@ -77,6 +111,8 @@ class AudioBridge:
             chunk = chunk + b"\x00" * (needed - len(chunk))
         elif len(chunk) > needed:
             chunk = chunk[:needed]
+        # Apply gain
+        chunk = self._apply_gain(chunk)
         outdata[:] = chunk
 
     @staticmethod
