@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
 import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'protocol.dart';
 
@@ -27,7 +28,7 @@ class OpenMicApp extends StatelessWidget {
   }
 }
 
-enum ConnectionStatus { disconnected, connecting, streaming, reconnecting, error }
+enum ConnectionStatus { disconnected, connecting, pairing, streaming, reconnecting, error }
 
 class ConnectionScreen extends StatefulWidget {
   const ConnectionScreen({super.key});
@@ -57,6 +58,12 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   Timer? _reconnectTimer;
   bool _userInitiatedDisconnect = false;
 
+  // Pairing state
+  String? _pendingPin;
+  Uint8List? _deviceId;
+  Uint8List? _authToken;
+  bool _showPairingDialog = false;
+
   BonsoirDiscovery? _discovery;
   StreamSubscription<BonsoirDiscoveryEvent>? _discoverySubscription;
   final Map<String, BonsoirService> _foundDevices = {};
@@ -65,6 +72,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   void initState() {
     super.initState();
     _startDiscovery();
+    _loadStoredCredentials();
   }
 
   Future<void> _startDiscovery() async {
@@ -105,6 +113,32 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     super.dispose();
   }
 
+  Future<void> _loadStoredCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    final deviceIdHex = prefs.getString('device_id');
+    final authTokenHex = prefs.getString('auth_token');
+    if (deviceIdHex != null && authTokenHex != null) {
+      _deviceId = Uint8List.fromList(deviceIdHex.split('').map((c) => int.parse(c, radix: 16)).toList());
+      _authToken = Uint8List.fromList(authTokenHex.split('').map((c) => int.parse(c, radix: 16)).toList());
+    }
+  }
+
+  Future<void> _saveCredentials(Uint8List deviceId, Uint8List authToken) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('device_id', deviceId.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
+    await prefs.setString('auth_token', authToken.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
+    _deviceId = deviceId;
+    _authToken = authToken;
+  }
+
+  Future<void> _clearCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('device_id');
+    await prefs.remove('auth_token');
+    _deviceId = null;
+    _authToken = null;
+  }
+
   Future<void> _connect() async {
     final ip = _ipController.text.trim();
     final port = int.tryParse(_portController.text.trim());
@@ -134,13 +168,16 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       _serverPort = port;
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
 
-      _socket!.send(
-        Protocol.packHello(_deviceName()),
-        _serverAddress!,
-        _serverPort,
-      );
+      // Send HELLO - paired or unpaired
+      Uint8List helloPacket;
+      if (_deviceId != null && _authToken != null) {
+        helloPacket = Protocol.packHelloPaired(_deviceId!, _authToken!, _deviceName());
+      } else {
+        helloPacket = Protocol.packHello(_deviceName());
+      }
+      _socket!.send(helloPacket, _serverAddress!, _serverPort);
 
-      // Wait for pairing challenge response from desktop (HELLO v0)
+      // Wait for response (challenge, ack, or pairing challenge)
       final completer = Completer<Datagram?>();
       late final StreamSubscription<RawSocketEvent> sub;
       sub = _socket!.listen((event) {
@@ -152,8 +189,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         }
       });
 
-      final challenge = await completer.future.timeout(
-        const Duration(seconds: 2),
+      final response = await completer.future.timeout(
+        const Duration(seconds: 5),
         onTimeout: () {
           if (!completer.isCompleted) completer.complete(null);
         },
@@ -161,34 +198,46 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
       await sub.cancel();
 
-      if (challenge == null) {
+      if (response == null) {
         throw Exception('Servidor não respondeu — verifique o IP e porta');
       }
 
-      final parsed = Protocol.unpack(challenge.data);
-      if (parsed == null || parsed.$1 != Protocol.hello) {
-        throw Exception('Resposta inesperada do servidor');
+      final parsed = Protocol.unpack(response.data);
+      if (parsed == null) {
+        throw Exception('Resposta inválida do servidor');
       }
 
-      final audioStream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: Protocol.sampleRate,
-          numChannels: Protocol.channels,
-        ),
-      );
+      // Handle different response types
+      final responseType = parsed['type'] as int;
+      if (responseType == Protocol.pairChal) {
+        // Pairing challenge received - show PIN to user
+        final pin = parsed['pin'] as String;
+        await _showPairingDialog(pin);
+        return; // Will continue after user confirms
+      } else if (responseType == Protocol.pairAck) {
+        // Pairing confirmed - save credentials and start streaming
+        final deviceId = parsed['deviceId'] as Uint8List;
+        final authToken = parsed['authToken'] as Uint8List;
+        await _saveCredentials(deviceId, authToken);
+        _startStreaming();
+        return;
+      } else if (responseType == Protocol.hello) {
+        // Legacy or paired response without pairing flow
+        final version = parsed['version'] as int;
+        if (version == Protocol.version) {
+          // Check if it's a paired response (has deviceId/authToken)
+          if (parsed['deviceId'] != null && parsed['authToken'] != null) {
+            await _saveCredentials(
+              parsed['deviceId'] as Uint8List,
+              parsed['authToken'] as Uint8List,
+            );
+          }
+        }
+        _startStreaming();
+        return;
+      }
 
-      _sequence = 0;
-      _audioSubscription = audioStream.listen(_onAudioChunk);
-
-      // Reset reconnect state on successful connection
-      _reconnectAttempt = 0;
-      _reconnectTimer?.cancel();
-      _reconnectTimer = null;
-
-      setState(() {
-        _status = ConnectionStatus.streaming;
-      });
+      throw Exception('Resposta inesperada do servidor: $responseType');
     } catch (error) {
       setState(() {
         _status = ConnectionStatus.error;
@@ -200,6 +249,126 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _scheduleReconnect();
       }
     }
+  }
+
+  Future<void> _showPairingDialog(String pin) async {
+    setState(() {
+      _pendingPin = pin;
+      _status = ConnectionStatus.pairing;
+    });
+
+    // Show dialog and wait for user confirmation
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Emparelhar dispositivo'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Confirme o PIN no computador:'),
+            const SizedBox(height: 16),
+            Text(
+              pin,
+              style: const TextStyle(
+                fontSize: 48,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 8,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Confirmar'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      // Send PAIR_RESP
+      _socket!.send(Protocol.packPairResponse(), _serverAddress!, _serverPort);
+
+      // Wait for PAIR_ACK
+      final completer = Completer<Datagram?>();
+      late final StreamSubscription<RawSocketEvent> sub;
+      sub = _socket!.listen((event) {
+        if (event == RawSocketEvent.read) {
+          final d = _socket!.receive();
+          if (d != null && !completer.isCompleted) {
+            completer.complete(d);
+          }
+        }
+      });
+
+      final ack = await completer.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          if (!completer.isCompleted) completer.complete(null);
+        },
+      );
+
+      await sub.cancel();
+
+      if (ack != null) {
+        final parsed = Protocol.unpack(ack.data);
+        if (parsed != null && parsed['type'] == Protocol.pairAck) {
+          final deviceId = parsed['deviceId'] as Uint8List;
+          final authToken = parsed['authToken'] as Uint8List;
+          await _saveCredentials(deviceId, authToken);
+          _startStreaming();
+          return;
+        }
+      }
+      throw Exception('Falha ao confirmar emparelhamento');
+    } else {
+      // User cancelled pairing
+      await _disconnect();
+      setState(() {
+        _status = ConnectionStatus.disconnected;
+      });
+    }
+  }
+
+  void _startStreaming() {
+    _sequence = 0;
+    _reconnectAttempt = 0;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+
+    final audioStream = _recorder.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: Protocol.sampleRate,
+        numChannels: Protocol.channels,
+      ),
+    );
+    audioStream.then((stream) {
+      if (mounted) {
+        _audioSubscription = stream.listen(_onAudioChunk);
+        setState(() {
+          _status = ConnectionStatus.streaming;
+        });
+      }
+    }).catchError((error) {
+      if (mounted) {
+        setState(() {
+          _status = ConnectionStatus.error;
+          _errorMessage = error.toString();
+        });
+        _disconnect();
+        if (!_userInitiatedDisconnect) {
+          _scheduleReconnect();
+        }
+      }
+    });
   }
 
   void _onAudioChunk(Uint8List chunk) {
@@ -281,11 +450,31 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isBusy = _status == ConnectionStatus.connecting || _status == ConnectionStatus.reconnecting;
+    final isBusy = _status == ConnectionStatus.connecting ||
+        _status == ConnectionStatus.reconnecting ||
+        _status == ConnectionStatus.pairing;
     final isStreaming = _status == ConnectionStatus.streaming;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('OpenMic')),
+      appBar: AppBar(
+        title: const Text('OpenMic'),
+        actions: [
+          if (_deviceId != null)
+            PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'unpair') {
+                  _showUnpairDialog();
+                }
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem(
+                  value: 'unpair',
+                  child: Text('Desemparelhar dispositivo'),
+                ),
+              ],
+            ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -343,7 +532,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
               onPressed: isBusy ? null : (isStreaming ? _disconnect : _connect),
               child: Text(
                 isBusy
-                    ? 'Conectando...'
+                    ? (_status == ConnectionStatus.pairing
+                        ? 'Emparelhando...'
+                        : 'Conectando...')
                     : (isStreaming ? 'Desconectar' : 'Conectar'),
               ),
             ),
@@ -353,6 +544,30 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _showUnpairDialog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Desemparelhar'),
+        content: const Text('Remover as credenciais deste dispositivo? Você precisará emparelhar novamente.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Desemparelhar'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await _clearCredentials();
+      setState(() {});
+    }
   }
 }
 
@@ -367,6 +582,7 @@ class _StatusBadge extends StatelessWidget {
     final (label, color) = switch (status) {
       ConnectionStatus.disconnected => ('Desconectado', Colors.grey),
       ConnectionStatus.connecting => ('Conectando...', Colors.orange),
+      ConnectionStatus.pairing => ('Aguardando emparelhamento...', Colors.blue),
       ConnectionStatus.reconnecting => ('Reconectando...', Colors.orange),
       ConnectionStatus.streaming => ('Transmitindo áudio', Colors.green),
       ConnectionStatus.error => (errorMessage ?? 'Erro', Colors.red),

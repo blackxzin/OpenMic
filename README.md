@@ -1,5 +1,7 @@
 # English Tutorial OpenMic 🇺🇸
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Turn your Android or iPhone into a wireless microphone for Linux over your WiFi network — an actively maintained alternative to WoMic and AudioRelay.
 
 - **Desktop app** (Linux only): creates a virtual microphone and receives the audio stream from your phone.

@@ -7,11 +7,41 @@ class Protocol {
   static const int hello = 0x01;
   static const int audio = 0x02;
   static const int bye = 0x03;
+  static const int pairChal = 0x04;
+  static const int pairResp = 0x05;
+  static const int pairAck = 0x06;
+
+  static const int version = 0x01;
 
   static const int sampleRate = 48000;
   static const int channels = 1;
 
+  static const int deviceIdLen = 16;
+  static const int authTokenLen = 16;
+  static const int pinLen = 6;
+
   static Uint8List packHello(String deviceName) {
+    final nameBytes = utf8.encode(deviceName);
+    final packet = Uint8List(2 + nameBytes.length);
+    packet[0] = hello;
+    packet[1] = version;
+    packet.setRange(2, packet.length, nameBytes);
+    return packet;
+  }
+
+  static Uint8List packHelloPaired(List<int> deviceId, List<int> authToken, String deviceName) {
+    final nameBytes = utf8.encode(deviceName);
+    final packet = Uint8List(2 + deviceIdLen + authTokenLen + nameBytes.length);
+    packet[0] = hello;
+    packet[1] = version;
+    packet.setRange(2, 2 + deviceIdLen, deviceId);
+    packet.setRange(2 + deviceIdLen, 2 + deviceIdLen + authTokenLen, authToken);
+    packet.setRange(2 + deviceIdLen + authTokenLen, packet.length, nameBytes);
+    return packet;
+  }
+
+  /// Pack a pre-versioning HELLO for pairing challenge (no version byte).
+  static Uint8List packHelloV0(String deviceName) {
     final nameBytes = utf8.encode(deviceName);
     final packet = Uint8List(1 + nameBytes.length);
     packet[0] = hello;
@@ -29,5 +59,75 @@ class Protocol {
 
   static Uint8List packBye() {
     return Uint8List.fromList([bye]);
+  }
+
+  static Uint8List packPairResponse() {
+    return Uint8List.fromList([pairResp]);
+  }
+
+  /// Returns (packetType, payload) or null if invalid.
+  /// Payload varies by type:
+  /// - HELLO: {version: int, deviceId: Uint8List?, authToken: Uint8List?, name: String}
+  /// - PAIR_CHAL: String (PIN)
+  /// - PAIR_ACK: {deviceId: Uint8List, authToken: Uint8List}
+  /// - AUDIO: (sequence, pcm) — not parsed here, handled directly
+  /// - PAIR_RESP, BYE: null
+  static dynamic unpack(Uint8List packet) {
+    if (packet.isEmpty) return null;
+    final type = packet[0];
+    switch (type) {
+      case hello:
+        // v1 protocol uses PROTOCOL_VERSION byte; v0 (pre-versioning) has name at packet[1].
+        if (packet.length < 3) return null;
+        final version = packet[1];
+        if (version == Protocol.version) {
+          // Check if paired HELLO (has device_id + auth_token = 32 bytes before name)
+          if (packet.length >= 2 + deviceIdLen + authTokenLen) {
+            final deviceId = packet.sublist(2, 2 + deviceIdLen);
+            final authToken = packet.sublist(2 + deviceIdLen, 2 + deviceIdLen + authTokenLen);
+            final name = utf8.decode(packet.sublist(2 + deviceIdLen + authTokenLen));
+            return {
+              'type': hello,
+              'version': version,
+              'deviceId': deviceId,
+              'authToken': authToken,
+              'name': name,
+            };
+          }
+          // Regular v1 HELLO
+          return {
+            'type': hello,
+            'version': version,
+            'deviceId': null,
+            'authToken': null,
+            'name': utf8.decode(packet.sublist(2)),
+          };
+        }
+        // Backward compat: treat as pre-versioning HELLO
+        return {
+          'type': hello,
+          'version': 0,
+          'deviceId': null,
+          'authToken': null,
+          'name': utf8.decode(packet.sublist(1)),
+        };
+      case pairChal:
+        if (packet.length < 1 + pinLen) return null;
+        return {
+          'type': pairChal,
+          'pin': utf8.decode(packet.sublist(1, 1 + pinLen)),
+        };
+      case pairAck:
+        if (packet.length < 1 + deviceIdLen + authTokenLen) return null;
+        return {
+          'type': pairAck,
+          'deviceId': packet.sublist(1, 1 + deviceIdLen),
+          'authToken': packet.sublist(1 + deviceIdLen, 1 + deviceIdLen + authTokenLen),
+        };
+      case bye:
+        return {'type': bye};
+      default:
+        return null;
+    }
   }
 }

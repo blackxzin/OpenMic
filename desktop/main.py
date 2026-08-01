@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 import socket
 import subprocess
@@ -22,8 +23,16 @@ from PySide6.QtWidgets import (
 from openmic.discovery import ServiceAdvertiser
 from openmic.server import AudioBridge, run_server
 from openmic.virtual_mic import VirtualMic, VirtualMicError
+from openmic.pairing import PairingStore
 
 DEFAULT_PORT = 45820
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+_log = logging.getLogger(__name__)
 
 
 _IP_ADDR_LINE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)")
@@ -73,6 +82,7 @@ class ServerSignals(QObject):
     log_message = Signal(str)
     device_connected = Signal(str, str)
     device_disconnected = Signal(str)
+    pairing_request = Signal(str, str)  # IP, PIN
 
 
 class ServerThread(threading.Thread):
@@ -89,19 +99,27 @@ class ServerThread(threading.Thread):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
-        def on_hello(addr, name):
+        def on_hello(addr, name, version, device_id, auth_token):
+            _log.info("Device connected: %s (%s, v%d)", name, addr[0], version)
             self._signals.device_connected.emit(addr[0], name)
 
         def on_bye(addr):
+            _log.info("Device disconnected: %s", addr[0])
             self._signals.device_disconnected.emit(addr[0])
+
+        def on_pairing_request(addr, pin):
+            _log.info("Pairing request from %s: PIN=%s", addr[0], pin)
+            self._signals.pairing_request.emit(addr[0], pin)
 
         try:
             self._transport = self._loop.run_until_complete(
-                run_server(self._host, self._port, self._bridge, on_hello, on_bye)
+                run_server(self._host, self._port, self._bridge, on_hello, on_bye, on_pairing_request)
             )
+            _log.info("Listening on %s:%d (UDP)", self._host, self._port)
             self._signals.log_message.emit(f"Ouvindo em {self._host}:{self._port} (UDP)")
             self._loop.run_forever()
         except OSError as exc:
+            _log.error("Failed to start server: %s", exc)
             self._signals.log_message.emit(f"Erro ao iniciar servidor: {exc}")
         finally:
             if self._transport is not None:
@@ -129,6 +147,7 @@ class MainWindow(QWidget):
         self._signals.log_message.connect(self._append_log)
         self._signals.device_connected.connect(self._on_device_connected)
         self._signals.device_disconnected.connect(self._on_device_disconnected)
+        self._signals.pairing_request.connect(self._on_pairing_request)
 
         layout = QVBoxLayout(self)
 
@@ -167,12 +186,16 @@ class MainWindow(QWidget):
     def _start_server(self) -> None:
         try:
             self._virtual_mic.create()
+            _log.info("Virtual microphone created")
         except VirtualMicError as exc:
+            _log.error("Failed to create virtual mic: %s", exc)
             self._append_log(f"Falha ao criar microfone virtual: {exc}")
             return
         try:
             self._bridge.start_output()
+            _log.info("Audio output started")
         except RuntimeError as exc:
+            _log.error("Failed to open audio output: %s", exc)
             self._append_log(f"Falha ao abrir saída de áudio: {exc}")
             self._virtual_mic.destroy()
             return
@@ -183,6 +206,7 @@ class MainWindow(QWidget):
 
         if self._local_ips:
             self._advertiser.start(port=port, ip=self._local_ips[0])
+            _log.info("mDNS advertising started on %s:%d", self._local_ips[0], port)
             self._append_log("Anunciando na rede via mDNS (descoberta automática)")
 
         self._toggle_button.setText("Parar servidor")
@@ -196,6 +220,7 @@ class MainWindow(QWidget):
         self._advertiser.stop()
         self._bridge.stop_output()
         self._virtual_mic.destroy()
+        _log.info("Server stopped")
         self._toggle_button.setText("Iniciar servidor")
         self._status_label.setText("Desligado")
 
@@ -209,6 +234,10 @@ class MainWindow(QWidget):
     def _on_device_disconnected(self, ip: str) -> None:
         self._status_label.setText("Aguardando conexão do celular...")
         self._append_log(f"Dispositivo desconectado: {ip}")
+
+    def _on_pairing_request(self, ip: str, pin: str) -> None:
+        self._status_label.setText(f"Emparelhar: {pin}")
+        self._append_log(f"Solicitação de emparelhamento de {ip} — PIN: {pin}")
 
     def closeEvent(self, event) -> None:
         self._stop_server()

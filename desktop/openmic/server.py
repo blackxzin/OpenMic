@@ -1,12 +1,16 @@
 """UDP server that receives PCM audio from the phone and plays it into the virtual sink."""
 
 import asyncio
+import logging
 import queue
 from typing import Callable, Optional
 
 import sounddevice as sd
 
 from . import protocol
+from .pairing import PairingStore, verify_pairing
+
+_log = logging.getLogger(__name__)
 
 
 class AudioBridge:
@@ -70,39 +74,101 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
     def __init__(
         self,
         bridge: AudioBridge,
-        on_hello: Optional[Callable[[tuple, str], None]],
+        on_hello: Optional[Callable[[tuple, str, int, bytes, bytes], None]],
         on_bye: Optional[Callable[[tuple], None]],
+        on_pairing_request: Optional[Callable[[tuple, str], None]],
     ):
         self._bridge = bridge
         self._on_hello = on_hello
         self._on_bye = on_bye
+        self._on_pairing_request = on_pairing_request
+        self.transport = None
+        self._store = PairingStore()
+        self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str}
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
         try:
             packet_type, payload = protocol.unpack(data)
         except ValueError:
             return
+
         if packet_type == protocol.HELLO:
-            if self._on_hello:
-                self._on_hello(addr, payload)
+            self._handle_hello(addr, payload)
         elif packet_type == protocol.AUDIO:
             _, pcm = payload
             self._bridge.push_audio(pcm)
         elif packet_type == protocol.BYE:
             if self._on_bye:
                 self._on_bye(addr)
+        elif packet_type == protocol.PAIR_RESP:
+            self._handle_pair_response(addr)
+        elif packet_type == protocol.PAIR_CHAL:
+            # Shouldn't receive this on desktop, but handle gracefully
+            _log.debug("Unexpected PAIR_CHAL from %s", addr)
+
+    def _handle_hello(self, addr, payload) -> None:
+        # payload is (version, device_id, auth_token, name)
+        version, device_id, auth_token, name = payload
+
+        if device_id is not None and auth_token is not None:
+            # Paired HELLO - verify credentials
+            if verify_pairing(device_id, auth_token, self._store):
+                stored_name = self._store.get_name(device_id) or name
+                _log.info("Trusted device connected: %s (%s)", stored_name, addr[0])
+                if self._on_hello:
+                    self._on_hello(addr, stored_name, version, device_id, auth_token)
+                return
+            else:
+                _log.warning("Invalid auth token from %s (%s)", name, addr[0])
+                # Fall through to new device pairing
+
+        # New/unpaired device - send pairing challenge
+        pin = protocol.generate_pin()
+        self._pending_pairing[addr] = {"pin": pin, "device_name": name}
+        challenge = protocol.pack_pair_challenge(pin)
+        self.transport.sendto(challenge, addr)
+        _log.info("Pairing challenge sent to %s (%s): PIN=%s", name, addr[0], pin)
+
+        if self._on_pairing_request:
+            self._on_pairing_request(addr, pin)
+
+    def _handle_pair_response(self, addr) -> None:
+        pending = self._pending_pairing.pop(addr, None)
+        if not pending:
+            _log.warning("PAIR_RESP from unknown addr: %s", addr)
+            return
+
+        # Generate device credentials
+        device_id = protocol.generate_device_id()
+        auth_token = protocol.generate_auth_token()
+
+        # Store credentials
+        self._store.add(device_id, auth_token, pending["device_name"])
+
+        # Send ACK with credentials
+        ack = protocol.pack_pair_ack(device_id, auth_token)
+        self.transport.sendto(ack, addr)
+        _log.info("Device paired successfully: %s (%s)", pending["device_name"], addr[0])
+
+        # Notify UI
+        if self._on_hello:
+            self._on_hello(addr, pending["device_name"], protocol.PROTOCOL_VERSION, device_id, auth_token)
 
 
 async def run_server(
     host: str,
     port: int,
     bridge: AudioBridge,
-    on_hello: Optional[Callable[[tuple, str], None]] = None,
+    on_hello: Optional[Callable[[tuple, str, int, bytes, bytes], None]] = None,
     on_bye: Optional[Callable[[tuple], None]] = None,
+    on_pairing_request: Optional[Callable[[tuple, str], None]] = None,
 ):
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: _MicServerProtocol(bridge, on_hello, on_bye),
+        lambda: _MicServerProtocol(bridge, on_hello, on_bye, on_pairing_request),
         local_addr=(host, port),
     )
     return transport
