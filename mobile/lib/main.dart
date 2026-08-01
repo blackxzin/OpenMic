@@ -27,7 +27,7 @@ class OpenMicApp extends StatelessWidget {
   }
 }
 
-enum ConnectionStatus { disconnected, connecting, streaming, error }
+enum ConnectionStatus { disconnected, connecting, streaming, reconnecting, error }
 
 class ConnectionScreen extends StatefulWidget {
   const ConnectionScreen({super.key});
@@ -49,6 +49,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   ConnectionStatus _status = ConnectionStatus.disconnected;
   String? _errorMessage;
+
+  // Reconnect state
+  int _reconnectAttempt = 0;
+  static const int _maxReconnectAttempts = 5;
+  static const Duration _baseReconnectDelay = Duration(seconds: 1);
+  Timer? _reconnectTimer;
+  bool _userInitiatedDisconnect = false;
 
   BonsoirDiscovery? _discovery;
   StreamSubscription<BonsoirDiscoveryEvent>? _discoverySubscription;
@@ -133,6 +140,36 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _serverPort,
       );
 
+      // Wait for pairing challenge response from desktop (HELLO v0)
+      final completer = Completer<Datagram?>();
+      late final StreamSubscription<RawSocketEvent> sub;
+      sub = _socket!.listen((event) {
+        if (event == RawSocketEvent.read) {
+          final d = _socket!.receive();
+          if (d != null && !completer.isCompleted) {
+            completer.complete(d);
+          }
+        }
+      });
+
+      final challenge = await completer.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {
+          if (!completer.isCompleted) completer.complete(null);
+        },
+      );
+
+      await sub.cancel();
+
+      if (challenge == null) {
+        throw Exception('Servidor não respondeu — verifique o IP e porta');
+      }
+
+      final parsed = Protocol.unpack(challenge.data);
+      if (parsed == null || parsed.$1 != Protocol.hello) {
+        throw Exception('Resposta inesperada do servidor');
+      }
+
       final audioStream = await _recorder.startStream(
         const RecordConfig(
           encoder: AudioEncoder.pcm16bits,
@@ -144,6 +181,11 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       _sequence = 0;
       _audioSubscription = audioStream.listen(_onAudioChunk);
 
+      // Reset reconnect state on successful connection
+      _reconnectAttempt = 0;
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
+
       setState(() {
         _status = ConnectionStatus.streaming;
       });
@@ -153,6 +195,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _errorMessage = error.toString();
       });
       await _disconnect();
+      // Schedule reconnect if not user-initiated
+      if (!_userInitiatedDisconnect) {
+        _scheduleReconnect();
+      }
     }
   }
 
@@ -160,11 +206,56 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     final socket = _socket;
     final address = _serverAddress;
     if (socket == null || address == null) return;
-    socket.send(Protocol.packAudio(_sequence, chunk), address, _serverPort);
-    _sequence = (_sequence + 1) & 0xFFFFFFFF;
+    try {
+      socket.send(Protocol.packAudio(_sequence, chunk), address, _serverPort);
+      _sequence = (_sequence + 1) & 0xFFFFFFFF;
+    } catch (e) {
+      // Socket error (e.g., network lost) — trigger reconnect
+      if (!_userInitiatedDisconnect && _status == ConnectionStatus.streaming) {
+        _handleConnectionLost();
+      }
+    }
+  }
+
+  Future<void> _handleConnectionLost() async {
+    await _disconnect();
+    if (!_userInitiatedDisconnect) {
+      _scheduleReconnect();
+    }
+  }
+
+  void _scheduleReconnect() {
+    if (_reconnectAttempt >= _maxReconnectAttempts) {
+      setState(() {
+        _status = ConnectionStatus.error;
+        _errorMessage = 'Máximo de tentativas de reconexão atingido';
+      });
+      return;
+    }
+
+    _reconnectAttempt++;
+    final delay = _baseReconnectDelay * (1 << (_reconnectAttempt - 1)); // exponential backoff
+    final cappedDelay = delay > const Duration(seconds: 30) ? const Duration(seconds: 30) : delay;
+
+    setState(() {
+      _status = ConnectionStatus.reconnecting;
+      _errorMessage = 'Reconectando... (tentativa $_reconnectAttempt/$_maxReconnectAttempts)';
+    });
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(cappedDelay, () {
+      if (mounted && !_userInitiatedDisconnect) {
+        _connect();
+      }
+    });
   }
 
   Future<void> _disconnect() async {
+    _userInitiatedDisconnect = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
+
     await _audioSubscription?.cancel();
     _audioSubscription = null;
 
@@ -190,7 +281,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isBusy = _status == ConnectionStatus.connecting;
+    final isBusy = _status == ConnectionStatus.connecting || _status == ConnectionStatus.reconnecting;
     final isStreaming = _status == ConnectionStatus.streaming;
 
     return Scaffold(
@@ -276,6 +367,7 @@ class _StatusBadge extends StatelessWidget {
     final (label, color) = switch (status) {
       ConnectionStatus.disconnected => ('Desconectado', Colors.grey),
       ConnectionStatus.connecting => ('Conectando...', Colors.orange),
+      ConnectionStatus.reconnecting => ('Reconectando...', Colors.orange),
       ConnectionStatus.streaming => ('Transmitindo áudio', Colors.green),
       ConnectionStatus.error => (errorMessage ?? 'Erro', Colors.red),
     };
