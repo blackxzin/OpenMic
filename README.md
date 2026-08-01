@@ -1,4 +1,4 @@
-# OpenMic 🇺🇸
+# English Tutorial OpenMic 🇺🇸
 
 Turn your Android or iPhone into a wireless microphone for Linux over your WiFi network — an actively maintained alternative to WoMic and AudioRelay.
 
@@ -46,7 +46,7 @@ iOS isn't distributed yet — see the open issues for status.
 
 ---
 
-# OpenMic 🇧🇷
+# Tutorial Português OpenMic 🇧🇷
 
 Transforme seu Android ou iPhone em um microfone sem fio para o Linux pela sua rede WiFi — uma alternativa ao WoMic e AudioRelay mantida ativamente.
 
