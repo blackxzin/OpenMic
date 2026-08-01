@@ -7,12 +7,16 @@ import sys
 import threading
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTextEdit,
@@ -135,11 +139,12 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OpenMic")
-        self.resize(420, 480)
+        self.resize(420, 560)
 
         self._virtual_mic = VirtualMic()
         self._bridge = AudioBridge(sink_device_name="OpenMicSink")
         self._advertiser = ServiceAdvertiser()
+        self._pairing_store = PairingStore()
         self._server_thread: Optional[ServerThread] = None
         self._local_ips = get_local_ips()
 
@@ -173,9 +178,32 @@ class MainWindow(QWidget):
         self._status_label = QLabel("Desligado")
         layout.addWidget(self._status_label)
 
+        # Paired devices section
+        self._devices_group = QGroupBox("Dispositivos emparelhados")
+        devices_layout = QVBoxLayout(self._devices_group)
+        self._devices_list = QListWidget()
+        self._devices_list.setMaximumHeight(80)
+        devices_layout.addWidget(self._devices_list)
+
+        devices_buttons = QHBoxLayout()
+        self._unpair_button = QPushButton("Remover selecionado")
+        self._unpair_button.clicked.connect(self._unpair_selected)
+        self._unpair_button.setEnabled(False)
+        self._unpair_all_button = QPushButton("Remover todos")
+        self._unpair_all_button.clicked.connect(self._unpair_all)
+        self._unpair_all_button.setEnabled(False)
+        devices_buttons.addWidget(self._unpair_button)
+        devices_buttons.addWidget(self._unpair_all_button)
+        devices_layout.addLayout(devices_buttons)
+        layout.addWidget(self._devices_group)
+
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         layout.addWidget(self._log)
+
+        self._refresh_device_list()
+
+        self._devices_list.itemSelectionChanged.connect(self._on_device_selection_changed)
 
     def _toggle_server(self) -> None:
         if self._server_thread is None:
@@ -238,6 +266,44 @@ class MainWindow(QWidget):
     def _on_pairing_request(self, ip: str, pin: str) -> None:
         self._status_label.setText(f"Emparelhar: {pin}")
         self._append_log(f"Solicitação de emparelhamento de {ip} — PIN: {pin}")
+
+    def _refresh_device_list(self) -> None:
+        self._devices_list.clear()
+        for device in self._pairing_store.list_all():
+            item = QListWidgetItem(f"{device['name']} ({device['device_id'][:8]}...)")
+            item.setData(Qt.UserRole, device["device_id"])
+            self._devices_list.addItem(item)
+        has_devices = self._devices_list.count() > 0
+        self._unpair_all_button.setEnabled(has_devices)
+
+    def _on_device_selection_changed(self) -> None:
+        self._unpair_button.setEnabled(len(self._devices_list.selectedItems()) > 0)
+
+    def _unpair_selected(self) -> None:
+        for item in self._devices_list.selectedItems():
+            device_id_hex = item.data(Qt.UserRole)
+            device_id = bytes.fromhex(device_id_hex)
+            name = item.text().split(" (")[0]
+            self._pairing_store.remove(device_id)
+            _log.info("Unpaired device: %s (%s...)", name, device_id_hex[:8])
+            self._append_log(f"Dispositivo desemparelhado: {name}")
+        self._refresh_device_list()
+
+    def _unpair_all(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Confirmar",
+            "Remover todos os dispositivos emparelhados?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for device in self._pairing_store.list_all():
+            device_id = bytes.fromhex(device["device_id"])
+            self._pairing_store.remove(device_id)
+        self._append_log("Todos os dispositivos foram desemparelhados")
+        self._refresh_device_list()
 
     def closeEvent(self, event) -> None:
         self._stop_server()
