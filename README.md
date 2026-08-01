@@ -43,3 +43,51 @@ If you'd rather not install FUSE at all, run the AppImage in extract-and-run mod
 Android APKs are published on the [Releases page](../../releases) — download and install `OpenMic.apk` (you'll need to allow installing from unknown sources, since it isn't on the Play Store).
 
 iOS isn't distributed yet — see the open issues for status.
+
+---
+
+# OpenMic 🇧🇷
+
+Transforme seu Android ou iPhone em um microfone sem fio para o Linux pela sua rede WiFi — uma alternativa ao WoMic e AudioRelay mantida ativamente.
+
+- **App desktop** (só Linux): cria um microfone virtual e recebe o áudio transmitido pelo celular.
+- **App mobile** (Android e iOS): captura o microfone do celular e transmite para o app desktop.
+
+Os dois apps se encontram automaticamente na mesma rede WiFi (sem precisar digitar IP), mas ainda dá pra digitar um manualmente caso a descoberta automática não funcione na sua rede.
+
+## Instalando no Linux
+
+### AppImage (funciona em qualquer distro)
+
+Um AppImage é um único arquivo que já vem com o app e tudo que ele precisa — sem instalação, sem depender de gerenciador de pacotes. Baixe o `OpenMic-x86_64.AppImage` na [página de Releases](../../releases) e depois:
+
+```bash
+chmod +x OpenMic-x86_64.AppImage
+./OpenMic-x86_64.AppImage
+```
+
+Ou simplesmente marque como executável pelas propriedades do arquivo no seu gerenciador de arquivos e dê dois cliques.
+
+AppImages precisam do FUSE pra rodar. A maioria das distros já vem com ele, mas algumas precisam de um passo extra antes:
+
+| Família da distro                           | O que fazer                                                        |
+|--------------------------------------------|--------------------------------------------------------------------|
+| Ubuntu 22.04+ / Linux Mint 21+ / Pop!\_OS 22.04+ | `sudo apt install libfuse2t64` (ou `libfuse2` em versões mais antigas) |
+| Debian, Ubuntu/Mint mais antigos           | Geralmente já funciona sem fazer nada                               |
+| Fedora / RHEL / CentOS / Nobara            | `sudo dnf install fuse fuse-libs`                                   |
+| Arch / Manjaro / EndeavourOS                | `sudo pacman -S fuse2`                                              |
+| openSUSE                                   | `sudo zypper install fuse`                                          |
+
+Se preferir não instalar o FUSE, dá pra rodar o AppImage em modo de extração-e-execução:
+
+```bash
+./OpenMic-x86_64.AppImage --appimage-extract-and-run
+```
+
+**Backend de áudio:** o OpenMic cria o microfone virtual através da camada de compatibilidade PulseAudio do PipeWire (`pactl`). Isso já vem por padrão no Ubuntu, Fedora e Arch atuais — se sua distro ainda usa PulseAudio puro (sem PipeWire), o app só precisa do `pactl` disponível no `PATH`, que o PulseAudio também fornece, então deve funcionar do mesmo jeito.
+
+## Instalando no Android / iOS
+
+Os APKs do Android são publicados na [página de Releases](../../releases) — baixe e instale o `OpenMic.apk` (você vai precisar permitir instalação de fontes desconhecidas, já que não está na Play Store).
+
+O iOS ainda não é distribuído — veja as issues abertas pra acompanhar o status.
