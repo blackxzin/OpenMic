@@ -4,9 +4,9 @@ import 'dart:typed_data';
 
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:opus_flutter/opus_flutter.dart';
 import 'package:record/record.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'protocol.dart';
 
@@ -138,9 +138,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   }
 
   Future<void> _loadStoredCredentials() async {
-    final prefs = await SharedPreferences.getInstance();
-    final deviceIdHex = prefs.getString('device_id');
-    final authTokenHex = prefs.getString('auth_token');
+    const storage = FlutterSecureStorage();
+    final deviceIdHex = await storage.read(key: 'device_id');
+    final authTokenHex = await storage.read(key: 'auth_token');
     if (deviceIdHex != null && authTokenHex != null) {
       _deviceId = Uint8List.fromList(deviceIdHex.split('').map((c) => int.parse(c, radix: 16)).toList());
       _authToken = Uint8List.fromList(authTokenHex.split('').map((c) => int.parse(c, radix: 16)).toList());
@@ -148,17 +148,17 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   }
 
   Future<void> _saveCredentials(Uint8List deviceId, Uint8List authToken) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('device_id', deviceId.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
-    await prefs.setString('auth_token', authToken.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
+    const storage = FlutterSecureStorage();
+    await storage.write(key: 'device_id', value: deviceId.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
+    await storage.write(key: 'auth_token', value: authToken.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
     _deviceId = deviceId;
     _authToken = authToken;
   }
 
   Future<void> _clearCredentials() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('device_id');
-    await prefs.remove('auth_token');
+    const storage = FlutterSecureStorage();
+    await storage.delete(key: 'device_id');
+    await storage.delete(key: 'auth_token');
     _deviceId = null;
     _authToken = null;
   }
