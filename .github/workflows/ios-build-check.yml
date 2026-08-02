@@ -28,4 +28,13 @@ jobs:
 
       - run: flutter pub get
 
+      - run: flutter clean
+
+      - name: Fresh pod install
+        run: |
+          rm -rf ios/Pods ios/Podfile.lock
+          cd ios
+          pod repo update
+          pod install
+
       - run: flutter build ios --no-codesign --simulator
