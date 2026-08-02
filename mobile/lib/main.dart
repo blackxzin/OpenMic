@@ -63,7 +63,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   String? _pendingPin;
   Uint8List? _deviceId;
   Uint8List? _authToken;
-  bool _showPairingDialog = false;
+  bool _isPairingDialogVisible = false;
 
   // Opus encoder
   OpusFlutter? _opusEncoder;
@@ -91,15 +91,21 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _discovery = discovery;
     await discovery.initialize();
     _discoverySubscription = discovery.eventStream?.listen((event) {
-      switch (event) {
-        case BonsoirDiscoveryServiceFoundEvent():
-          event.service.resolve(discovery.serviceResolver);
-        case BonsoirDiscoveryServiceResolvedEvent():
-          setState(() => _foundDevices[event.service.name] = event.service);
-        case BonsoirDiscoveryServiceLostEvent():
-          setState(() => _foundDevices.remove(event.service.name));
-        default:
-          break;
+      if (event is BonsoirDiscoveryServiceFoundEvent) {
+        final svc = event.service;
+        if (svc != null) {
+          svc.resolve(discovery.serviceResolver);
+        }
+      } else if (event is BonsoirDiscoveryServiceResolvedEvent) {
+        final svc = event.service;
+        if (svc != null) {
+          setState(() => _foundDevices[svc.name] = svc);
+        }
+      } else if (event is BonsoirDiscoveryServiceLostEvent) {
+        final svc = event.service;
+        if (svc != null) {
+          setState(() => _foundDevices.remove(svc.name));
+        }
       }
     });
     await discovery.start();
@@ -713,14 +719,34 @@ class _StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final (label, color) = switch (status) {
-      ConnectionStatus.disconnected => ('Desconectado', Colors.grey),
-      ConnectionStatus.connecting => ('Conectando...', Colors.orange),
-      ConnectionStatus.pairing => ('Aguardando emparelhamento...', Colors.blue),
-      ConnectionStatus.reconnecting => ('Reconectando...', Colors.orange),
-      ConnectionStatus.streaming => ('Transmitindo áudio', Colors.green),
-      ConnectionStatus.error => (errorMessage ?? 'Erro', Colors.red),
-    };
+    String label;
+    Color color;
+    switch (status) {
+      case ConnectionStatus.disconnected:
+        label = 'Desconectado';
+        color = Colors.grey;
+        break;
+      case ConnectionStatus.connecting:
+        label = 'Conectando...';
+        color = Colors.orange;
+        break;
+      case ConnectionStatus.pairing:
+        label = 'Aguardando emparelhamento...';
+        color = Colors.blue;
+        break;
+      case ConnectionStatus.reconnecting:
+        label = 'Reconectando...';
+        color = Colors.orange;
+        break;
+      case ConnectionStatus.streaming:
+        label = 'Transmitindo áudio';
+        color = Colors.green;
+        break;
+      case ConnectionStatus.error:
+        label = errorMessage ?? 'Erro';
+        color = Colors.red;
+        break;
+    }
     return Row(
       children: [
         Icon(Icons.circle, size: 12, color: color),
@@ -804,7 +830,7 @@ class _VuMeter extends StatelessWidget {
                       bottom: 0,
                       child: Container(
                         width: 4,
-                        color: Colors.white.withValues(alpha: 0.7),
+                        color: Colors.white.withOpacity(0.7),
                       ),
                     ),
                 ],
