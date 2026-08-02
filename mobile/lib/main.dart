@@ -1,11 +1,13 @@
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:opus_flutter/opus_flutter.dart';
+import 'package:opus_dart/opus_dart.dart';
+import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
 import 'package:record/record.dart';
 
 import 'protocol.dart';
@@ -66,7 +68,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   bool _isPairingDialogVisible = false;
 
   // Opus encoder
-  OpusFlutter? _opusEncoder;
+  SimpleOpusEncoder? _opusEncoder;
 
   // VU meter state
   double _vuLevel = 0.0;  // 0.0 to 1.0
@@ -127,20 +129,20 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _ipController.dispose();
     _portController.dispose();
     _recorder.dispose();
-    _opusEncoder?.close();
+    _opusEncoder?.destroy();
     _vuUpdateTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _initOpusEncoder() async {
     try {
-      _opusEncoder = await OpusFlutter.create(
+      final DynamicLibrary lib = await opus_flutter.load();
+      initOpus(lib);
+      _opusEncoder = SimpleOpusEncoder(
         sampleRate: Protocol.sampleRate,
         channels: Protocol.channels,
-        bitrate: Protocol.opusBitrate,
-        frameSize: Protocol.opusFrameSamples,
+        application: Application.voip,
       );
-      _opusEncoder?.setBitrate(Protocol.opusBitrate);
     } catch (e) {
       _logDebug('Opus encoder unavailable: $e');
     }
@@ -446,16 +448,23 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   void _onAudioChunkOpus(Uint8List pcmChunk) {
     final socket = _socket;
     final address = _serverAddress;
-    if (socket == null || address == null) return;
+    final encoder = _opusEncoder;
+    if (socket == null || address == null || encoder == null) return;
 
     // Update VU meter
     _updateVuLevel(pcmChunk);
 
     try {
-      // Encode PCM to Opus
-      final opusData = _opusEncoder!.encode(pcmChunk);
-      if (opusData != null) {
-        socket.send(Protocol.packAudioOpus(_sequence, opusData), address, _serverPort);
+      // Encode PCM to Opus: opus_dart expects Int16List
+      final pcmInt16 = Int16List.view(
+        pcmChunk.buffer,
+        pcmChunk.offsetInBytes,
+        pcmChunk.lengthInBytes ~/ 2,
+      );
+      final opusData = encoder.encode(input: pcmInt16);
+      if (opusData.isNotEmpty) {
+        final opusBytes = Uint8List.fromList(opusData);
+        socket.send(Protocol.packAudioOpus(_sequence, opusBytes), address, _serverPort);
         _sequence = (_sequence + 1) & 0xFFFFFFFF;
       }
     } catch (e) {
