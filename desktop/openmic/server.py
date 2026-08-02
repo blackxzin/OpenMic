@@ -1,12 +1,18 @@
 """UDP server that receives PCM audio from the phone and plays it into the virtual sink."""
 
 import asyncio
+import logging
 import queue
+import threading
 from typing import Callable, Optional
 
 import sounddevice as sd
 
 from . import protocol
+from .opus_codec import OpusDecoder, _OPUS_AVAILABLE
+from .pairing import PairingStore, verify_pairing
+
+_log = logging.getLogger(__name__)
 
 
 class AudioBridge:
@@ -16,6 +22,9 @@ class AudioBridge:
         self._sink_device_name = sink_device_name
         self._queue: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
         self._stream: Optional[sd.RawOutputStream] = None
+        self._opus_decoder: Optional[OpusDecoder] = None
+        self._gain: float = 1.0
+        self._gain_lock = threading.Lock()
 
     def start_output(self) -> None:
         # PortAudio caches its device list at init time, so a sink created after this
@@ -33,17 +42,63 @@ class AudioBridge:
         )
         self._stream.start()
 
-    def stop_output(self) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        if _OPUS_AVAILABLE:
+            self._opus_decoder = OpusDecoder()
+            _log.info("Opus decoder ready")
+        else:
+            _log.warning("Opus decoder unavailable — only raw PCM will work")
+
+    @property
+    def gain(self) -> float:
+        with self._gain_lock:
+            return self._gain
+
+    @gain.setter
+    def gain(self, value: float) -> None:
+        # Clamp between 0.0 and 5.0 (0% to 500%)
+        with self._gain_lock:
+            self._gain = max(0.0, min(5.0, value))
+        _log.debug("Gain set to %.2f", self._gain)
 
     def push_audio(self, pcm: bytes) -> None:
         try:
             self._queue.put_nowait(pcm)
         except queue.Full:
             pass  # falling behind: drop this chunk rather than build up latency
+
+    def push_opus(self, opus_data: bytes) -> None:
+        """Decode Opus frame and feed resulting PCM into the queue."""
+        if self._opus_decoder is None:
+            _log.debug("Opus frame received but decoder unavailable")
+            return
+        pcm = self._opus_decoder.decode(opus_data)
+        if pcm is not None:
+            self.push_audio(pcm)
+
+    def stop_output(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+    def _apply_gain(self, data: bytes) -> bytes:
+        """Apply gain to int16 PCM data. Returns new bytes."""
+        if self._gain == 1.0:
+            return data
+        # Convert to int16 array, apply gain, convert back
+        import array
+        samples = array.array('h', data)
+        with self._gain_lock:
+            gain = self._gain
+        for i in range(len(samples)):
+            val = int(samples[i] * gain)
+            # Clamp to int16 range
+            if val > 32767:
+                val = 32767
+            elif val < -32768:
+                val = -32768
+            samples[i] = val
+        return samples.tobytes()
 
     def _audio_callback(self, outdata, frames, time_info, status):
         needed = frames * protocol.SAMPLE_WIDTH * protocol.CHANNELS
@@ -56,6 +111,8 @@ class AudioBridge:
             chunk = chunk + b"\x00" * (needed - len(chunk))
         elif len(chunk) > needed:
             chunk = chunk[:needed]
+        # Apply gain
+        chunk = self._apply_gain(chunk)
         outdata[:] = chunk
 
     @staticmethod
@@ -70,39 +127,104 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
     def __init__(
         self,
         bridge: AudioBridge,
-        on_hello: Optional[Callable[[tuple, str], None]],
+        on_hello: Optional[Callable[[tuple, str, int, bytes, bytes], None]],
         on_bye: Optional[Callable[[tuple], None]],
+        on_pairing_request: Optional[Callable[[tuple, str], None]],
     ):
         self._bridge = bridge
         self._on_hello = on_hello
         self._on_bye = on_bye
+        self._on_pairing_request = on_pairing_request
+        self.transport = None
+        self._store = PairingStore()
+        self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str}
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
         try:
             packet_type, payload = protocol.unpack(data)
         except ValueError:
             return
+
         if packet_type == protocol.HELLO:
-            if self._on_hello:
-                self._on_hello(addr, payload)
+            self._handle_hello(addr, payload)
         elif packet_type == protocol.AUDIO:
             _, pcm = payload
             self._bridge.push_audio(pcm)
+        elif packet_type == protocol.AUDIO_OPUS:
+            _, opus_data = payload
+            self._bridge.push_opus(opus_data)
         elif packet_type == protocol.BYE:
             if self._on_bye:
                 self._on_bye(addr)
+        elif packet_type == protocol.PAIR_RESP:
+            self._handle_pair_response(addr)
+        elif packet_type == protocol.PAIR_CHAL:
+            # Shouldn't receive this on desktop, but handle gracefully
+            _log.debug("Unexpected PAIR_CHAL from %s", addr)
+
+    def _handle_hello(self, addr, payload) -> None:
+        # payload is (version, device_id, auth_token, name)
+        version, device_id, auth_token, name = payload
+
+        if device_id is not None and auth_token is not None:
+            # Paired HELLO - verify credentials
+            if verify_pairing(device_id, auth_token, self._store):
+                stored_name = self._store.get_name(device_id) or name
+                _log.info("Trusted device connected: %s (%s)", stored_name, addr[0])
+                if self._on_hello:
+                    self._on_hello(addr, stored_name, version, device_id, auth_token)
+                return
+            else:
+                _log.warning("Invalid auth token from %s (%s)", name, addr[0])
+                # Fall through to new device pairing
+
+        # New/unpaired device - send pairing challenge
+        pin = protocol.generate_pin()
+        self._pending_pairing[addr] = {"pin": pin, "device_name": name}
+        challenge = protocol.pack_pair_challenge(pin)
+        self.transport.sendto(challenge, addr)
+        _log.info("Pairing challenge sent to %s (%s): PIN=%s", name, addr[0], pin)
+
+        if self._on_pairing_request:
+            self._on_pairing_request(addr, pin)
+
+    def _handle_pair_response(self, addr) -> None:
+        pending = self._pending_pairing.pop(addr, None)
+        if not pending:
+            _log.warning("PAIR_RESP from unknown addr: %s", addr)
+            return
+
+        # Generate device credentials
+        device_id = protocol.generate_device_id()
+        auth_token = protocol.generate_auth_token()
+
+        # Store credentials
+        self._store.add(device_id, auth_token, pending["device_name"])
+
+        # Send ACK with credentials
+        ack = protocol.pack_pair_ack(device_id, auth_token)
+        self.transport.sendto(ack, addr)
+        _log.info("Device paired successfully: %s (%s)", pending["device_name"], addr[0])
+
+        # Notify UI
+        if self._on_hello:
+            self._on_hello(addr, pending["device_name"], protocol.PROTOCOL_VERSION, device_id, auth_token)
 
 
 async def run_server(
     host: str,
     port: int,
     bridge: AudioBridge,
-    on_hello: Optional[Callable[[tuple, str], None]] = None,
+    on_hello: Optional[Callable[[tuple, str, int, bytes, bytes], None]] = None,
     on_bye: Optional[Callable[[tuple], None]] = None,
+    on_pairing_request: Optional[Callable[[tuple, str], None]] = None,
 ):
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: _MicServerProtocol(bridge, on_hello, on_bye),
+        lambda: _MicServerProtocol(bridge, on_hello, on_bye, on_pairing_request),
         local_addr=(host, port),
     )
     return transport
