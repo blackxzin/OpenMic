@@ -72,5 +72,40 @@ class TestPairingHandshake(_PairingCase):
         self.assertEqual(self._acks_sent(), [])
 
 
+class TestTrustedReconnect(_PairingCase):
+    """After pairing, a reconnect HELLO must get a reply so the mobile's
+    connect handshake resolves — it does NOT sit and time out forever."""
+
+    def test_trusted_hello_gets_hello_reply(self):
+        # Simulate an already-paired device: store its creds first.
+        dev_id = bytes(range(16))
+        auth = bytes(range(16, 32))
+        self.protocol._store.add(dev_id, auth, "Phone")
+
+        self.protocol.datagram_received(
+            p.pack_hello_paired(dev_id, auth, "Phone"), self.addr
+        )
+
+        # Must have sent exactly one HELLO datagram back (no PIN challenge).
+        replies = [d for a, d in self.transport.sent if d[0] == p.HELLO]
+        self.assertEqual(len(replies), 1)
+        # And it must not contain credentials (so the phone does not re-key).
+        ptype, (ver, rid, rauth, rname) = p.unpack(replies[0])
+        self.assertEqual(ptype, p.HELLO)
+        self.assertEqual(ver, p.PROTOCOL_VERSION)
+        self.assertIsNone(rid)
+        self.assertIsNone(rauth)
+        self.assertEqual(rname, "Phone")
+
+    def test_trusted_hello_invalid_token_gets_challenge(self):
+        self.protocol._store.add(bytes(range(16)), bytes(range(16, 32)), "Phone")
+        self.protocol.datagram_received(
+            p.pack_hello_paired(bytes(range(16)), b"\x00" * 16, "Fake"),
+            self.addr,
+        )
+        chals = [d for a, d in self.transport.sent if d[0] == p.PAIR_CHAL]
+        self.assertEqual(len(chals), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

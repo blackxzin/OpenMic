@@ -213,6 +213,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     try {
       _serverAddress = InternetAddress(ip);
       _serverPort = port;
+      // Never leak a prior bind: if a previous attempt's socket wasn't torn
+      // down (e.g. a race between a reconnect timer and a manual connect),
+      // close it before binding a fresh one.
+      await _socket?.close();
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
 
       // Send HELLO - paired or unpaired

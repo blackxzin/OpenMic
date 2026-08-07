@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import queue
+import struct
 import threading
 import time as _time
 from typing import Callable, Optional
@@ -79,7 +80,13 @@ class AudioBridge:
         if self._opus_decoder is None:
             _log.debug("Opus frame received but decoder unavailable")
             return
-        pcm = self._opus_decoder.decode(opus_data)
+        try:
+            pcm = self._opus_decoder.decode(opus_data)
+        except Exception:
+            # A corrupt/hostile Opus frame raises an opuslib exception. Drop the
+            # frame instead of letting it escape to asyncio and spam the log.
+            _log.debug("Dropping undecodable Opus frame (%d bytes)", len(opus_data))
+            return
         if pcm is not None:
             self.push_audio(pcm)
 
@@ -183,7 +190,12 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
             elif packet_type == protocol.PAIR_CHAL:
                 # Shouldn't receive this on desktop, but handle gracefully
                 _log.debug("Unexpected PAIR_CHAL from %s", addr)
-        except (ValueError, TypeError, KeyError, IndexError) as exc:
+        except (ValueError, TypeError, KeyError, IndexError, struct.error) as exc:
+            # Includes struct.error (short AUDIO/OPUS frames) and broad runtime
+            # failures from the Opus decoder on a corrupted frame. Without this
+            # a single hostile datagram would escape to asyncio and spam a full
+            # stack trace per packet (log-flood). The loop survives regardless;
+            # we just drop cleanly instead.
             _log.debug("Dropping malformed datagram from %s: %s", addr, exc)
             return
 
@@ -198,6 +210,10 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
                 _log.info("Trusted device connected: %s (%s)", stored_name, addr[0])
                 if self._on_hello:
                     self._on_hello(addr, stored_name, version, device_id, auth_token)
+                # Reply so the phone's connect handshake resolves. pack_hello has
+                # no credentials, so the phone starts streaming immediately and
+                # does not re-save (or reset) its stored creds.
+                self.transport.sendto(protocol.pack_hello(stored_name), addr)
                 return
             else:
                 _log.warning("Invalid auth token from %s (%s)", name, addr[0])
