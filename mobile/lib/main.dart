@@ -157,8 +157,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     final deviceIdHex = await storage.read(key: 'device_id');
     final authTokenHex = await storage.read(key: 'auth_token');
     if (deviceIdHex != null && authTokenHex != null) {
-      _deviceId = Uint8List.fromList(deviceIdHex.split('').map((c) => int.parse(c, radix: 16)).toList());
-      _authToken = Uint8List.fromList(authTokenHex.split('').map((c) => int.parse(c, radix: 16)).toList());
+      _deviceId = _hexToBytes(deviceIdHex);
+      _authToken = _hexToBytes(authTokenHex);
     }
   }
 
@@ -332,8 +332,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     );
 
     if (confirmed == true) {
-      // Send PAIR_RESP
-      _socket!.send(Protocol.packPairResponse(), _serverAddress!, _serverPort);
+      // Send PAIR_RESP, echoing the PIN so the desktop can verify the user
+      // really entered the same code on the phone.
+      _socket!.send(
+        Protocol.packPairResponse(pin),
+        _serverAddress!,
+        _serverPort,
+      );
 
       // Wait for PAIR_ACK
       final completer = Completer<Datagram?>();
@@ -592,6 +597,16 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   }
 
   String _deviceName() => Platform.isIOS ? 'iPhone' : 'Android';
+
+  /// Decode a hex string to bytes (2 hex chars per byte). Inverse of the
+  /// padLeft(2,'0') join written by [_saveCredentials].
+  Uint8List _hexToBytes(String hex) {
+    final out = Uint8List(hex.length ~/ 2);
+    for (int i = 0; i < out.length; i++) {
+      out[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return out;
+  }
 
   @override
   Widget build(BuildContext context) {

@@ -75,8 +75,12 @@ class Protocol {
     return Uint8List.fromList([bye]);
   }
 
-  static Uint8List packPairResponse() {
-    return Uint8List.fromList([pairResp]);
+  static Uint8List packPairResponse(String pin) {
+    final bytes = utf8.encode(pin);
+    final packet = Uint8List(1 + bytes.length);
+    packet[0] = pairResp;
+    packet.setRange(1, packet.length, bytes);
+    return packet;
   }
 
   /// Returns (packetType, payload) or null if invalid.

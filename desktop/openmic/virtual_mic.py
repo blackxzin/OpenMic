@@ -85,7 +85,7 @@ class VirtualMic:
             return None
         for line in result.stdout.splitlines():
             parts = line.split("\t")
-            if len(parts) >= 2 and parts[1] == module_type and arg in parts[1]:
+            if len(parts) >= 2 and parts[1] == module_type and arg in line:
                 try:
                     return int(parts[0])
                 except ValueError:
