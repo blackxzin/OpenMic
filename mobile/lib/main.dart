@@ -69,6 +69,11 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   // Opus encoder
   SimpleOpusEncoder? _opusEncoder;
+  // Raw PCM16 accumulator for Opus: opus_dart requires exactly
+  // [Protocol.opusFrameSamples] (960) samples per encode call, and the
+  // recorder yields chunks of arbitrary size. We buffer until a full frame
+  // is available instead of feeding misaligned chunks.
+  final List<int> _pcmBuffer = [];
 
   // VU meter state
   double _vuLevel = 0.0;  // 0.0 to 1.0
@@ -432,23 +437,33 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     // Update VU meter
     _updateVuLevel(pcmChunk);
 
-    try {
-      // Encode PCM to Opus: opus_dart expects Int16List
-      final pcmInt16 = Int16List.view(
-        pcmChunk.buffer,
-        pcmChunk.offsetInBytes,
-        pcmChunk.lengthInBytes ~/ 2,
+    final frameSamples = Protocol.opusFrameSamples;
+    // Accumulate the chunk, then emit one encoded Opus frame per completed
+    // 960-sample window. Any trailing partial samples stay buffered.
+    _pcmBuffer.addAll(pcmChunk);
+    while (_pcmBuffer.length >= frameSamples * 2) {
+      final frame = Int16List.fromList(
+        _pcmBuffer.sublist(0, frameSamples * 2),
       );
-      final opusData = encoder.encode(input: pcmInt16);
-      if (opusData.isNotEmpty) {
-        final opusBytes = Uint8List.fromList(opusData);
-        socket.send(Protocol.packAudioOpus(_sequence, opusBytes), address, _serverPort);
-        _sequence = (_sequence + 1) & 0xFFFFFFFF;
-      }
-    } catch (e) {
-      // Socket error (e.g., network lost) — trigger reconnect
-      if (!_userInitiatedDisconnect && _status == ConnectionStatus.streaming) {
-        _handleConnectionLost();
+      _pcmBuffer.removeRange(0, frameSamples * 2);
+
+      try {
+        final opusData = encoder.encode(input: frame);
+        if (opusData.isNotEmpty) {
+          final opusBytes = Uint8List.fromList(opusData);
+          socket.send(
+            Protocol.packAudioOpus(_sequence, opusBytes),
+            address,
+            _serverPort,
+          );
+          _sequence = (_sequence + 1) & 0xFFFFFFFF;
+        }
+      } on SocketException {
+        // Network lost — trigger reconnect. Codec errors must NOT take this
+        // path: they're transient and the socket is still healthy.
+        if (!_userInitiatedDisconnect && _status == ConnectionStatus.streaming) {
+          _handleConnectionLost();
+        }
       }
     }
   }
@@ -475,15 +490,20 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   void _updateVuLevel(Uint8List pcmChunk) {
     // Calculate RMS (root mean square) of the audio chunk
     // pcmChunk is int16 little-endian
-    if (pcmChunk.length < 2) return;
+    final int sampleCount = pcmChunk.length >> 1;
+    if (sampleCount == 0) return;
 
     double sumSquares = 0.0;
-    final int sampleCount = pcmChunk.length ~/ 2;
-    for (int i = 0; i < pcmChunk.length; i += 2) {
-      // Convert two bytes to int16 (little-endian)
-      final int sample = (pcmChunk[i] | (pcmChunk[i + 1] << 8));
-      // Normalize to -1.0 to 1.0
-      final double normalized = sample / 32768.0;
+    // Iterate whole int16 samples to avoid an out-of-bounds read on an odd
+    // trailing byte.
+    final Int16List samples = Int16List.view(
+      pcmChunk.buffer,
+      pcmChunk.offsetInBytes,
+      sampleCount,
+    );
+    for (int i = 0; i < sampleCount; i++) {
+      // Int16List gives the signed value directly (little-endian host order).
+      final double normalized = samples[i] / 32768.0;
       sumSquares += normalized * normalized;
     }
     final double rms = sampleCount > 0 ? (sumSquares / sampleCount) : 0.0;
@@ -549,6 +569,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   Future<void> _disconnect() async {
     await _audioSubscription?.cancel();
     _audioSubscription = null;
+    _pcmBuffer.clear();
 
     if (await _recorder.isRecording()) {
       await _recorder.stop();

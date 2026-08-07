@@ -226,10 +226,16 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
             _log.info("Expired pairing challenge from %s (%s)", pending["device_name"], addr[0])
             return
 
-        # Reject the challenge if the echoed PIN does not match the one we sent.
-        # Empty payload means a legacy client that can't echo — still accept.
-        if pin_payload and pin_payload != pending["pin"]:
-            _log.warning("PIN mismatch from %s (%s)", pending["device_name"], addr[0])
+        # Require the echoed PIN to match the one we sent. Every client in this
+        # codebase (mobile) echoes it, so a missing/empty payload is rejected
+        # too — otherwise a bare [PAIR_RESP] byte would silently pair.
+        if pin_payload != pending["pin"]:
+            _log.warning(
+                "PIN mismatch from %s (%s): got %r",
+                pending["device_name"],
+                addr[0],
+                pin_payload,
+            )
             return
 
         # Generate device credentials
