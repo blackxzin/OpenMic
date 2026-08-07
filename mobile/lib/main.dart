@@ -188,6 +188,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       });
       return;
     }
+    // A fresh connect attempt is never user-cancelled, so auto-reconnect is
+    // allowed again.
+    _userInitiatedDisconnect = false;
 
     setState(() {
       _status = ConnectionStatus.connecting;
@@ -387,11 +390,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
-    if (_opusEncoder == null) {
-      _logDebug('Opus encoder not available, falling back to PCM');
-      _startPcmStreaming();
-      return;
-    }
+    final useOpus = _opusEncoder != null;
+    if (!useOpus) _logDebug('Opus encoder not available, falling back to PCM');
 
     final audioStream = _recorder.startStream(
       const RecordConfig(
@@ -402,36 +402,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     );
     audioStream.then((stream) {
       if (mounted) {
-        _audioSubscription = stream.listen(_onAudioChunkOpus);
-        setState(() {
-          _status = ConnectionStatus.streaming;
-        });
-      }
-    }).catchError((error) {
-      if (mounted) {
-        setState(() {
-          _status = ConnectionStatus.error;
-          _errorMessage = error.toString();
-        });
-        _disconnect();
-        if (!_userInitiatedDisconnect) {
-          _scheduleReconnect();
-        }
-      }
-    });
-  }
-
-  void _startPcmStreaming() {
-    final audioStream = _recorder.startStream(
-      const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: Protocol.sampleRate,
-        numChannels: Protocol.channels,
-      ),
-    );
-    audioStream.then((stream) {
-      if (mounted) {
-        _audioSubscription = stream.listen(_onAudioChunk);
+        _audioSubscription = stream.listen(
+          useOpus ? _onAudioChunkOpus : _onAudioChunk,
+        );
         setState(() {
           _status = ConnectionStatus.streaming;
         });
@@ -569,12 +542,11 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     });
   }
 
+  /// Pure teardown: stop the recorder + socket and reset state. Does NOT touch
+  /// [_userInitiatedDisconnect] or the reconnect timer — that's the caller's
+  /// job, because this runs on both user-initiated disconnects and the
+  /// internal reconnect path.
   Future<void> _disconnect() async {
-    _userInitiatedDisconnect = true;
-    _reconnectTimer?.cancel();
-    _reconnectTimer = null;
-    _reconnectAttempt = 0;
-
     await _audioSubscription?.cancel();
     _audioSubscription = null;
 
@@ -594,6 +566,15 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _status = ConnectionStatus.disconnected;
       });
     }
+  }
+
+  /// Disconnect because the user asked: block auto-reconnect.
+  Future<void> _disconnectByUser() async {
+    _userInitiatedDisconnect = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
+    await _disconnect();
   }
 
   String _deviceName() => Platform.isIOS ? 'iPhone' : 'Android';
@@ -689,7 +670,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
             ),
             const SizedBox(height: 24),
             FilledButton(
-              onPressed: isBusy ? null : (isStreaming ? _disconnect : _connect),
+              onPressed: isBusy ? null : (isStreaming ? _disconnectByUser : _connect),
               child: Text(
                 isBusy
                     ? (_status == ConnectionStatus.pairing

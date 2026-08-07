@@ -4,8 +4,10 @@ import asyncio
 import logging
 import queue
 import threading
+import time as _time
 from typing import Callable, Optional
 
+import numpy as np
 import sounddevice as sd
 
 from . import protocol
@@ -93,20 +95,11 @@ class AudioBridge:
         """Apply gain to int16 PCM data. Returns new bytes."""
         if self._gain == 1.0:
             return data
-        # Convert to int16 array, apply gain, convert back
-        import array
-        samples = array.array('h', data)
         with self._gain_lock:
             gain = self._gain
-        for i in range(len(samples)):
-            val = int(samples[i] * gain)
-            # Clamp to int16 range
-            if val > 32767:
-                val = 32767
-            elif val < -32768:
-                val = -32768
-            samples[i] = val
-        return samples.tobytes()
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        scaled = (samples * gain).clip(-32768.0, 32767.0).astype(np.int16)
+        return scaled.tobytes()
 
     def _audio_callback(self, outdata, frames, time_info, status):
         needed = frames * protocol.SAMPLE_WIDTH * protocol.CHANNELS
@@ -161,7 +154,8 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         self._on_pairing_request = on_pairing_request
         self.transport = None
         self._store = PairingStore()
-        self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str}
+        self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str, "ts": float}
+        self._pair_ttl = 60.0  # seconds a challenge stays valid before expiring
 
     def connection_made(self, transport):
         self.transport = transport
@@ -211,7 +205,7 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
 
         # New/unpaired device - send pairing challenge
         pin = protocol.generate_pin()
-        self._pending_pairing[addr] = {"pin": pin, "device_name": name}
+        self._pending_pairing[addr] = {"pin": pin, "device_name": name, "ts": _time.monotonic()}
         challenge = protocol.pack_pair_challenge(pin)
         self.transport.sendto(challenge, addr)
         _log.info("Pairing challenge sent to %s (%s): PIN=%s", name, addr[0], pin)
@@ -223,6 +217,13 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         pending = self._pending_pairing.pop(addr, None)
         if not pending:
             _log.warning("PAIR_RESP from unknown addr: %s", addr)
+            return
+
+        # Reject expired challenges: the PIN shown on the desktop is only valid
+        # for a short window, and cleaning up here caps memory for never-
+        # answered pairing requests.
+        if pending["ts"] + self._pair_ttl < _time.monotonic():
+            _log.info("Expired pairing challenge from %s (%s)", pending["device_name"], addr[0])
             return
 
         # Reject the challenge if the echoed PIN does not match the one we sent.
