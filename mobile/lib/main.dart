@@ -69,6 +69,11 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   // Opus encoder
   SimpleOpusEncoder? _opusEncoder;
+  // Raw PCM16 accumulator for Opus: opus_dart requires exactly
+  // [Protocol.opusFrameSamples] (960) samples per encode call, and the
+  // recorder yields chunks of arbitrary size. We buffer until a full frame
+  // is available instead of feeding misaligned chunks.
+  final List<int> _pcmBuffer = [];
 
   // VU meter state
   double _vuLevel = 0.0;  // 0.0 to 1.0
@@ -157,8 +162,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     final deviceIdHex = await storage.read(key: 'device_id');
     final authTokenHex = await storage.read(key: 'auth_token');
     if (deviceIdHex != null && authTokenHex != null) {
-      _deviceId = Uint8List.fromList(deviceIdHex.split('').map((c) => int.parse(c, radix: 16)).toList());
-      _authToken = Uint8List.fromList(authTokenHex.split('').map((c) => int.parse(c, radix: 16)).toList());
+      _deviceId = _hexToBytes(deviceIdHex);
+      _authToken = _hexToBytes(authTokenHex);
     }
   }
 
@@ -188,6 +193,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       });
       return;
     }
+    // A fresh connect attempt is never user-cancelled, so auto-reconnect is
+    // allowed again.
+    _userInitiatedDisconnect = false;
 
     setState(() {
       _status = ConnectionStatus.connecting;
@@ -205,6 +213,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     try {
       _serverAddress = InternetAddress(ip);
       _serverPort = port;
+      // Never leak a prior bind: if a previous attempt's socket wasn't torn
+      // down (e.g. a race between a reconnect timer and a manual connect),
+      // close it before binding a fresh one.
+      await _socket?.close();
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
 
       // Send HELLO - paired or unpaired
@@ -332,8 +344,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     );
 
     if (confirmed == true) {
-      // Send PAIR_RESP
-      _socket!.send(Protocol.packPairResponse(), _serverAddress!, _serverPort);
+      // Send PAIR_RESP, echoing the PIN so the desktop can verify the user
+      // really entered the same code on the phone.
+      _socket!.send(
+        Protocol.packPairResponse(pin),
+        _serverAddress!,
+        _serverPort,
+      );
 
       // Wait for PAIR_ACK
       final completer = Completer<Datagram?>();
@@ -382,11 +399,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
-    if (_opusEncoder == null) {
-      _logDebug('Opus encoder not available, falling back to PCM');
-      _startPcmStreaming();
-      return;
-    }
+    final useOpus = _opusEncoder != null;
+    if (!useOpus) _logDebug('Opus encoder not available, falling back to PCM');
 
     final audioStream = _recorder.startStream(
       const RecordConfig(
@@ -397,36 +411,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     );
     audioStream.then((stream) {
       if (mounted) {
-        _audioSubscription = stream.listen(_onAudioChunkOpus);
-        setState(() {
-          _status = ConnectionStatus.streaming;
-        });
-      }
-    }).catchError((error) {
-      if (mounted) {
-        setState(() {
-          _status = ConnectionStatus.error;
-          _errorMessage = error.toString();
-        });
-        _disconnect();
-        if (!_userInitiatedDisconnect) {
-          _scheduleReconnect();
-        }
-      }
-    });
-  }
-
-  void _startPcmStreaming() {
-    final audioStream = _recorder.startStream(
-      const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: Protocol.sampleRate,
-        numChannels: Protocol.channels,
-      ),
-    );
-    audioStream.then((stream) {
-      if (mounted) {
-        _audioSubscription = stream.listen(_onAudioChunk);
+        _audioSubscription = stream.listen(
+          useOpus ? _onAudioChunkOpus : _onAudioChunk,
+        );
         setState(() {
           _status = ConnectionStatus.streaming;
         });
@@ -454,23 +441,33 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     // Update VU meter
     _updateVuLevel(pcmChunk);
 
-    try {
-      // Encode PCM to Opus: opus_dart expects Int16List
-      final pcmInt16 = Int16List.view(
-        pcmChunk.buffer,
-        pcmChunk.offsetInBytes,
-        pcmChunk.lengthInBytes ~/ 2,
+    final frameSamples = Protocol.opusFrameSamples;
+    // Accumulate the chunk, then emit one encoded Opus frame per completed
+    // 960-sample window. Any trailing partial samples stay buffered.
+    _pcmBuffer.addAll(pcmChunk);
+    while (_pcmBuffer.length >= frameSamples * 2) {
+      final frame = Int16List.fromList(
+        _pcmBuffer.sublist(0, frameSamples * 2),
       );
-      final opusData = encoder.encode(input: pcmInt16);
-      if (opusData.isNotEmpty) {
-        final opusBytes = Uint8List.fromList(opusData);
-        socket.send(Protocol.packAudioOpus(_sequence, opusBytes), address, _serverPort);
-        _sequence = (_sequence + 1) & 0xFFFFFFFF;
-      }
-    } catch (e) {
-      // Socket error (e.g., network lost) — trigger reconnect
-      if (!_userInitiatedDisconnect && _status == ConnectionStatus.streaming) {
-        _handleConnectionLost();
+      _pcmBuffer.removeRange(0, frameSamples * 2);
+
+      try {
+        final opusData = encoder.encode(input: frame);
+        if (opusData.isNotEmpty) {
+          final opusBytes = Uint8List.fromList(opusData);
+          socket.send(
+            Protocol.packAudioOpus(_sequence, opusBytes),
+            address,
+            _serverPort,
+          );
+          _sequence = (_sequence + 1) & 0xFFFFFFFF;
+        }
+      } on SocketException {
+        // Network lost — trigger reconnect. Codec errors must NOT take this
+        // path: they're transient and the socket is still healthy.
+        if (!_userInitiatedDisconnect && _status == ConnectionStatus.streaming) {
+          _handleConnectionLost();
+        }
       }
     }
   }
@@ -497,15 +494,20 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   void _updateVuLevel(Uint8List pcmChunk) {
     // Calculate RMS (root mean square) of the audio chunk
     // pcmChunk is int16 little-endian
-    if (pcmChunk.length < 2) return;
+    final int sampleCount = pcmChunk.length >> 1;
+    if (sampleCount == 0) return;
 
     double sumSquares = 0.0;
-    final int sampleCount = pcmChunk.length ~/ 2;
-    for (int i = 0; i < pcmChunk.length; i += 2) {
-      // Convert two bytes to int16 (little-endian)
-      final int sample = (pcmChunk[i] | (pcmChunk[i + 1] << 8));
-      // Normalize to -1.0 to 1.0
-      final double normalized = sample / 32768.0;
+    // Iterate whole int16 samples to avoid an out-of-bounds read on an odd
+    // trailing byte.
+    final Int16List samples = Int16List.view(
+      pcmChunk.buffer,
+      pcmChunk.offsetInBytes,
+      sampleCount,
+    );
+    for (int i = 0; i < sampleCount; i++) {
+      // Int16List gives the signed value directly (little-endian host order).
+      final double normalized = samples[i] / 32768.0;
       sumSquares += normalized * normalized;
     }
     final double rms = sampleCount > 0 ? (sumSquares / sampleCount) : 0.0;
@@ -564,14 +566,14 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     });
   }
 
+  /// Pure teardown: stop the recorder + socket and reset state. Does NOT touch
+  /// [_userInitiatedDisconnect] or the reconnect timer — that's the caller's
+  /// job, because this runs on both user-initiated disconnects and the
+  /// internal reconnect path.
   Future<void> _disconnect() async {
-    _userInitiatedDisconnect = true;
-    _reconnectTimer?.cancel();
-    _reconnectTimer = null;
-    _reconnectAttempt = 0;
-
     await _audioSubscription?.cancel();
     _audioSubscription = null;
+    _pcmBuffer.clear();
 
     if (await _recorder.isRecording()) {
       await _recorder.stop();
@@ -591,7 +593,26 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     }
   }
 
+  /// Disconnect because the user asked: block auto-reconnect.
+  Future<void> _disconnectByUser() async {
+    _userInitiatedDisconnect = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
+    await _disconnect();
+  }
+
   String _deviceName() => Platform.isIOS ? 'iPhone' : 'Android';
+
+  /// Decode a hex string to bytes (2 hex chars per byte). Inverse of the
+  /// padLeft(2,'0') join written by [_saveCredentials].
+  Uint8List _hexToBytes(String hex) {
+    final out = Uint8List(hex.length ~/ 2);
+    for (int i = 0; i < out.length; i++) {
+      out[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return out;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -674,7 +695,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
             ),
             const SizedBox(height: 24),
             FilledButton(
-              onPressed: isBusy ? null : (isStreaming ? _disconnect : _connect),
+              onPressed: isBusy ? null : (isStreaming ? _disconnectByUser : _connect),
               child: Text(
                 isBusy
                     ? (_status == ConnectionStatus.pairing

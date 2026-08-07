@@ -78,9 +78,9 @@ def pack_pair_challenge(pin: str) -> bytes:
     return bytes([PAIR_CHAL]) + pin.encode("ascii")
 
 
-def pack_pair_response() -> bytes:
-    """Phone -> Desktop: user confirmed PIN."""
-    return bytes([PAIR_RESP])
+def pack_pair_response(pin: str) -> bytes:
+    """Phone -> Desktop: user confirmed PIN, echoing it back for validation."""
+    return bytes([PAIR_RESP]) + pin.encode("ascii")
 
 
 def pack_pair_ack(device_id: bytes, auth_token: bytes) -> bytes:
@@ -131,7 +131,9 @@ def unpack(packet: bytes):
         pin = packet[1:].decode("ascii", errors="replace")
         return PAIR_CHAL, pin
     if packet_type == PAIR_RESP:
-        return PAIR_RESP, None
+        # v1: echoes the PIN as an ASCII payload for validation; v0: empty.
+        pin = packet[1:].decode("ascii", errors="replace")
+        return PAIR_RESP, pin
     if packet_type == PAIR_ACK:
         if len(packet) < 1 + DEVICE_ID_LEN + AUTH_TOKEN_LEN:
             raise ValueError("PAIR_ACK too short")

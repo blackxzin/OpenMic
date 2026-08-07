@@ -3,9 +3,12 @@
 import asyncio
 import logging
 import queue
+import struct
 import threading
+import time as _time
 from typing import Callable, Optional
 
+import numpy as np
 import sounddevice as sd
 
 from . import protocol
@@ -25,6 +28,12 @@ class AudioBridge:
         self._opus_decoder: Optional[OpusDecoder] = None
         self._gain: float = 1.0
         self._gain_lock = threading.Lock()
+        # Leftover PCM bytes not yet consumed by the audio callback. Opus frames
+        # (960 samples) and PortAudio's callback size rarely align, so we resample
+        # through a partial-frame accumulator instead of truncating each chunk
+        # (which dropped most of every Opus frame).
+        self._fragment = b""
+        self._fragment_lock = threading.Lock()
 
     def start_output(self) -> None:
         # PortAudio caches its device list at init time, so a sink created after this
@@ -71,7 +80,13 @@ class AudioBridge:
         if self._opus_decoder is None:
             _log.debug("Opus frame received but decoder unavailable")
             return
-        pcm = self._opus_decoder.decode(opus_data)
+        try:
+            pcm = self._opus_decoder.decode(opus_data)
+        except Exception:
+            # A corrupt/hostile Opus frame raises an opuslib exception. Drop the
+            # frame instead of letting it escape to asyncio and spam the log.
+            _log.debug("Dropping undecodable Opus frame (%d bytes)", len(opus_data))
+            return
         if pcm is not None:
             self.push_audio(pcm)
 
@@ -80,40 +95,49 @@ class AudioBridge:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        with self._fragment_lock:
+            self._fragment = b""
 
     def _apply_gain(self, data: bytes) -> bytes:
         """Apply gain to int16 PCM data. Returns new bytes."""
         if self._gain == 1.0:
             return data
-        # Convert to int16 array, apply gain, convert back
-        import array
-        samples = array.array('h', data)
         with self._gain_lock:
             gain = self._gain
-        for i in range(len(samples)):
-            val = int(samples[i] * gain)
-            # Clamp to int16 range
-            if val > 32767:
-                val = 32767
-            elif val < -32768:
-                val = -32768
-            samples[i] = val
-        return samples.tobytes()
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        scaled = (samples * gain).clip(-32768.0, 32767.0).astype(np.int16)
+        return scaled.tobytes()
 
     def _audio_callback(self, outdata, frames, time_info, status):
         needed = frames * protocol.SAMPLE_WIDTH * protocol.CHANNELS
-        try:
-            chunk = self._queue.get_nowait()
-        except queue.Empty:
-            outdata[:] = b"\x00" * needed
-            return
+        with self._fragment_lock:
+            pending = self._fragment
+            while len(pending) < needed:
+                try:
+                    pending += self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._fragment, chunk = AudioBridge.reassemble(
+                pending, b"", needed
+            )
+        # Gaps (queue underrun or a leftover tail) are silence.
         if len(chunk) < needed:
             chunk = chunk + b"\x00" * (needed - len(chunk))
-        elif len(chunk) > needed:
-            chunk = chunk[:needed]
-        # Apply gain
-        chunk = self._apply_gain(chunk)
-        outdata[:] = chunk
+        outdata[:] = self._apply_gain(chunk)
+
+    @staticmethod
+    def reassemble(existing: bytes, incoming: bytes, needed: int):
+        """Pull the next fixed-size frame from the PCM backlog.
+
+        Returns (leftover, frame) where leftover retains every byte not
+        consumed by THIS frame — including any extra full frames that arrived
+        in the same batch. Callers splice `leftover` back for the next callback
+        so nothing is ever dropped. Testable without PortAudio.
+        """
+        pending = existing + incoming
+        if len(pending) < needed:
+            return pending, b""
+        return pending[needed:], pending[:needed]
 
     @staticmethod
     def _find_device_index(name_substring: str) -> int:
@@ -137,33 +161,43 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         self._on_pairing_request = on_pairing_request
         self.transport = None
         self._store = PairingStore()
-        self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str}
+        self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str, "ts": float}
+        self._pair_ttl = 60.0  # seconds a challenge stays valid before expiring
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
         try:
-            packet_type, payload = protocol.unpack(data)
-        except ValueError:
-            return
+            unpacked = protocol.unpack(data)
+            if unpacked is None:
+                return
+            packet_type, payload = unpacked
 
-        if packet_type == protocol.HELLO:
-            self._handle_hello(addr, payload)
-        elif packet_type == protocol.AUDIO:
-            _, pcm = payload
-            self._bridge.push_audio(pcm)
-        elif packet_type == protocol.AUDIO_OPUS:
-            _, opus_data = payload
-            self._bridge.push_opus(opus_data)
-        elif packet_type == protocol.BYE:
-            if self._on_bye:
-                self._on_bye(addr)
-        elif packet_type == protocol.PAIR_RESP:
-            self._handle_pair_response(addr)
-        elif packet_type == protocol.PAIR_CHAL:
-            # Shouldn't receive this on desktop, but handle gracefully
-            _log.debug("Unexpected PAIR_CHAL from %s", addr)
+            if packet_type == protocol.HELLO:
+                self._handle_hello(addr, payload)
+            elif packet_type == protocol.AUDIO:
+                _, pcm = payload
+                self._bridge.push_audio(pcm)
+            elif packet_type == protocol.AUDIO_OPUS:
+                _, opus_data = payload
+                self._bridge.push_opus(opus_data)
+            elif packet_type == protocol.BYE:
+                if self._on_bye:
+                    self._on_bye(addr)
+            elif packet_type == protocol.PAIR_RESP:
+                self._handle_pair_response(addr, payload)
+            elif packet_type == protocol.PAIR_CHAL:
+                # Shouldn't receive this on desktop, but handle gracefully
+                _log.debug("Unexpected PAIR_CHAL from %s", addr)
+        except (ValueError, TypeError, KeyError, IndexError, struct.error) as exc:
+            # Includes struct.error (short AUDIO/OPUS frames) and broad runtime
+            # failures from the Opus decoder on a corrupted frame. Without this
+            # a single hostile datagram would escape to asyncio and spam a full
+            # stack trace per packet (log-flood). The loop survives regardless;
+            # we just drop cleanly instead.
+            _log.debug("Dropping malformed datagram from %s: %s", addr, exc)
+            return
 
     def _handle_hello(self, addr, payload) -> None:
         # payload is (version, device_id, auth_token, name)
@@ -176,6 +210,10 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
                 _log.info("Trusted device connected: %s (%s)", stored_name, addr[0])
                 if self._on_hello:
                     self._on_hello(addr, stored_name, version, device_id, auth_token)
+                # Reply so the phone's connect handshake resolves. pack_hello has
+                # no credentials, so the phone starts streaming immediately and
+                # does not re-save (or reset) its stored creds.
+                self.transport.sendto(protocol.pack_hello(stored_name), addr)
                 return
             else:
                 _log.warning("Invalid auth token from %s (%s)", name, addr[0])
@@ -183,7 +221,7 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
 
         # New/unpaired device - send pairing challenge
         pin = protocol.generate_pin()
-        self._pending_pairing[addr] = {"pin": pin, "device_name": name}
+        self._pending_pairing[addr] = {"pin": pin, "device_name": name, "ts": _time.monotonic()}
         challenge = protocol.pack_pair_challenge(pin)
         self.transport.sendto(challenge, addr)
         _log.info("Pairing challenge sent to %s (%s): PIN=%s", name, addr[0], pin)
@@ -191,10 +229,29 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         if self._on_pairing_request:
             self._on_pairing_request(addr, pin)
 
-    def _handle_pair_response(self, addr) -> None:
+    def _handle_pair_response(self, addr, pin_payload) -> None:
         pending = self._pending_pairing.pop(addr, None)
         if not pending:
             _log.warning("PAIR_RESP from unknown addr: %s", addr)
+            return
+
+        # Reject expired challenges: the PIN shown on the desktop is only valid
+        # for a short window, and cleaning up here caps memory for never-
+        # answered pairing requests.
+        if pending["ts"] + self._pair_ttl < _time.monotonic():
+            _log.info("Expired pairing challenge from %s (%s)", pending["device_name"], addr[0])
+            return
+
+        # Require the echoed PIN to match the one we sent. Every client in this
+        # codebase (mobile) echoes it, so a missing/empty payload is rejected
+        # too — otherwise a bare [PAIR_RESP] byte would silently pair.
+        if pin_payload != pending["pin"]:
+            _log.warning(
+                "PIN mismatch from %s (%s): got %r",
+                pending["device_name"],
+                addr[0],
+                pin_payload,
+            )
             return
 
         # Generate device credentials
