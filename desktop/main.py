@@ -43,6 +43,16 @@ _log = logging.getLogger(__name__)
 
 _IP_ADDR_LINE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)")
 
+# Virtual interfaces created by container/VM tooling never reach the phone —
+# they're isolated bridge networks local to this machine (Docker, Podman,
+# libvirt, VPNs). Surfacing one of these as the "use this" IP produces an
+# address the phone can never connect to.
+_VIRTUAL_IFACE_PREFIXES = ("docker", "br-", "veth", "virbr", "vmnet", "podman", "tun", "tap")
+
+
+def _is_virtual_iface(name: str) -> bool:
+    return name.startswith(_VIRTUAL_IFACE_PREFIXES)
+
 
 def get_local_ips() -> list[str]:
     """Local IPv4 addresses, WiFi interfaces first.
@@ -66,8 +76,9 @@ def get_local_ips() -> list[str]:
             match = _IP_ADDR_LINE.match(line)
             if match:
                 iface, ip = match.groups()
-                if not ip.startswith("127."):
-                    by_iface[iface] = ip
+                if ip.startswith("127.") or _is_virtual_iface(iface):
+                    continue
+                by_iface[iface] = ip
     except (OSError, subprocess.SubprocessError):
         pass
 
