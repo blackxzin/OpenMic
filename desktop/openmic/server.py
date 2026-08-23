@@ -12,6 +12,7 @@ import numpy as np
 import sounddevice as sd
 
 from . import protocol
+from .noise_suppression import NoiseSuppressor
 from .opus_codec import OpusDecoder, _OPUS_AVAILABLE
 from .pairing import PairingStore, verify_pairing
 
@@ -28,6 +29,7 @@ class AudioBridge:
         self._opus_decoder: Optional[OpusDecoder] = None
         self._gain: float = 1.0
         self._gain_lock = threading.Lock()
+        self._noise_suppressor = NoiseSuppressor(frame_size=protocol.OPUS_FRAME_SAMPLES)
         # Leftover PCM bytes not yet consumed by the audio callback. Opus frames
         # (960 samples) and PortAudio's callback size rarely align, so we resample
         # through a partial-frame accumulator instead of truncating each chunk
@@ -69,9 +71,24 @@ class AudioBridge:
             self._gain = max(0.0, min(5.0, value))
         _log.debug("Gain set to %.2f", self._gain)
 
+    @property
+    def noise_suppression_enabled(self) -> bool:
+        return self._noise_suppressor.enabled
+
+    @noise_suppression_enabled.setter
+    def noise_suppression_enabled(self, value: bool) -> None:
+        self._noise_suppressor.enabled = value
+        _log.debug("Noise suppression %s", "enabled" if value else "disabled")
+
     def push_audio(self, pcm: bytes) -> None:
+        # Runs in packet-arrival order (single asyncio loop thread), which is
+        # what the suppressor's overlap-add state requires — never call this
+        # concurrently from more than one thread.
+        processed = self._noise_suppressor.process(pcm)
+        if not processed:
+            return  # still filling the analysis window; nothing ready yet
         try:
-            self._queue.put_nowait(pcm)
+            self._queue.put_nowait(processed)
         except queue.Full:
             pass  # falling behind: drop this chunk rather than build up latency
 
@@ -97,6 +114,7 @@ class AudioBridge:
             self._stream = None
         with self._fragment_lock:
             self._fragment = b""
+        self._noise_suppressor.reset()
 
     def _apply_gain(self, data: bytes) -> bytes:
         """Apply gain to int16 PCM data. Returns new bytes."""

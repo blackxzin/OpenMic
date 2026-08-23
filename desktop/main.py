@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QCheckBox,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -197,6 +198,11 @@ class MainWindow(QWidget):
 
         layout.addWidget(gain_group)
 
+        self._noise_suppression_checkbox = QCheckBox("Redução de ruído de fundo")
+        self._noise_suppression_checkbox.setChecked(True)
+        self._noise_suppression_checkbox.toggled.connect(self._on_noise_suppression_toggled)
+        layout.addWidget(self._noise_suppression_checkbox)
+
         # Paired devices section
         self._devices_group = QGroupBox("Dispositivos emparelhados")
         devices_layout = QVBoxLayout(self._devices_group)
@@ -291,6 +297,9 @@ class MainWindow(QWidget):
         gain = value / 100.0
         self._bridge.gain = gain
         self._gain_label.setText(f"{value}%")
+
+    def _on_noise_suppression_toggled(self, checked: bool) -> None:
+        self._bridge.noise_suppression_enabled = checked
 
     def _refresh_device_list(self) -> None:
         self._devices_list.clear()

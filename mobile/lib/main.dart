@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -62,10 +61,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   bool _userInitiatedDisconnect = false;
 
   // Pairing state
-  String? _pendingPin;
   Uint8List? _deviceId;
   Uint8List? _authToken;
-  bool _isPairingDialogVisible = false;
 
   // Opus encoder
   SimpleOpusEncoder? _opusEncoder;
@@ -99,20 +96,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     await discovery.initialize();
     _discoverySubscription = discovery.eventStream?.listen((event) {
       if (event is BonsoirDiscoveryServiceFoundEvent) {
-        final svc = event.service;
-        if (svc != null) {
-          svc.resolve(discovery.serviceResolver);
-        }
+        event.service.resolve(discovery.serviceResolver);
       } else if (event is BonsoirDiscoveryServiceResolvedEvent) {
         final svc = event.service;
-        if (svc != null) {
-          setState(() => _foundDevices[svc.name] = svc);
-        }
+        setState(() => _foundDevices[svc.name] = svc);
       } else if (event is BonsoirDiscoveryServiceLostEvent) {
         final svc = event.service;
-        if (svc != null) {
-          setState(() => _foundDevices.remove(svc.name));
-        }
+        setState(() => _foundDevices.remove(svc.name));
       }
     });
     await discovery.start();
@@ -141,7 +131,11 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   Future<void> _initOpusEncoder() async {
     try {
-      final DynamicLibrary lib = await opus_flutter.load();
+      // No static type here: opus_flutter.load() returns Future<dynamic>
+      // because its actual DynamicLibrary type (dart:ffi vs web_ffi) is
+      // resolved per-platform inside opus_dart's own conditional export —
+      // annotating it dart:ffi's DynamicLibrary here fights that resolution.
+      final lib = await opus_flutter.load();
       initOpus(lib);
       _opusEncoder = SimpleOpusEncoder(
         sampleRate: Protocol.sampleRate,
@@ -216,7 +210,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       // Never leak a prior bind: if a previous attempt's socket wasn't torn
       // down (e.g. a race between a reconnect timer and a manual connect),
       // close it before binding a fresh one.
-      await _socket?.close();
+      _socket?.close();
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
 
       // Send HELLO - paired or unpaired
@@ -244,6 +238,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         const Duration(seconds: 5),
         onTimeout: () {
           if (!completer.isCompleted) completer.complete(null);
+          return null;
         },
       );
 
@@ -304,7 +299,6 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   Future<void> _showPairingDialog(String pin) async {
     setState(() {
-      _pendingPin = pin;
       _status = ConnectionStatus.pairing;
     });
 
@@ -368,6 +362,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         const Duration(seconds: 5),
         onTimeout: () {
           if (!completer.isCompleted) completer.complete(null);
+          return null;
         },
       );
 
@@ -407,6 +402,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         encoder: AudioEncoder.pcm16bits,
         sampleRate: Protocol.sampleRate,
         numChannels: Protocol.channels,
+        // Best-effort: uses the platform's native noise suppressor (Android
+        // NoiseSuppressor effect / iOS voice processing) when the device
+        // supports it. No-op otherwise — never throws.
+        noiseSuppress: true,
       ),
     );
     audioStream.then((stream) {
@@ -446,9 +445,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     // 960-sample window. Any trailing partial samples stay buffered.
     _pcmBuffer.addAll(pcmChunk);
     while (_pcmBuffer.length >= frameSamples * 2) {
-      final frame = Int16List.fromList(
+      // Decode little-endian byte pairs into int16 samples (matches the
+      // desktop's np.frombuffer(dtype=int16) reader) — Int16List.fromList
+      // would instead treat each raw byte as a whole sample, corrupting audio.
+      final frameBytes = Uint8List.fromList(
         _pcmBuffer.sublist(0, frameSamples * 2),
       );
+      final frame = Int16List.view(frameBytes.buffer, 0, frameSamples);
       _pcmBuffer.removeRange(0, frameSamples * 2);
 
       try {
@@ -860,7 +863,7 @@ class _VuMeter extends StatelessWidget {
                       bottom: 0,
                       child: Container(
                         width: 4,
-                        color: Colors.white.withOpacity(0.7),
+                        color: Colors.white.withValues(alpha: 0.7),
                       ),
                     ),
                 ],
