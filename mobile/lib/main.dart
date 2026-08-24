@@ -14,14 +14,15 @@ import 'protocol.dart';
 
 const _serviceType = '_openmic._udp';
 
-/// Android-only: keeps the WiFi radio at full power (WIFI_MODE_FULL_HIGH_PERF)
-/// while connected/pairing. See MainActivity.kt for why this exists.
-const _wifiLockChannel = MethodChannel('dev.openmic/wifi_lock');
+/// Android-only native helpers. See MainActivity.kt for what each side does.
+const _nativeChannel = MethodChannel('dev.openmic/wifi_lock');
 
+/// Keeps the WiFi radio at full power (WIFI_MODE_FULL_HIGH_PERF) while
+/// connected/pairing — see MainActivity.kt for why this exists.
 Future<void> _acquireWifiLock() async {
   if (!Platform.isAndroid) return;
   try {
-    await _wifiLockChannel.invokeMethod('acquire');
+    await _nativeChannel.invokeMethod('acquire');
   } on PlatformException {
     // Best-effort: streaming still works without it, just more exposed to
     // the radio idling down.
@@ -31,7 +32,32 @@ Future<void> _acquireWifiLock() async {
 Future<void> _releaseWifiLock() async {
   if (!Platform.isAndroid) return;
   try {
-    await _wifiLockChannel.invokeMethod('release');
+    await _nativeChannel.invokeMethod('release');
+  } on PlatformException {
+    // Nothing to clean up if this fails.
+  }
+}
+
+/// Runs a foreground service with a persistent notification while streaming.
+/// Without this, Android is free to suspend mic capture in the background
+/// (screen off, app not visible) with no error surfaced anywhere — audio
+/// just silently stops, same failure class the WifiLock above fixes for the
+/// network side. Mirrors the WifiLock's lifecycle: held through reconnect
+/// attempts, released on dispose, give-up, or user-initiated disconnect.
+Future<void> _startForegroundService() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _nativeChannel.invokeMethod('startForegroundService');
+  } on PlatformException {
+    // Best-effort: streaming still works without it, just more exposed to
+    // the OS suspending capture in the background.
+  }
+}
+
+Future<void> _stopForegroundService() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _nativeChannel.invokeMethod('stopForegroundService');
   } on PlatformException {
     // Nothing to clean up if this fails.
   }
@@ -153,6 +179,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   void dispose() {
     _disconnect();
     unawaited(_releaseWifiLock());
+    unawaited(_stopForegroundService());
     _discoverySubscription?.cancel();
     _discovery?.stop();
     _ipController.dispose();
@@ -245,6 +272,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     // allowed again.
     _userInitiatedDisconnect = false;
     await _acquireWifiLock();
+    await _startForegroundService();
 
     setState(() {
       _status = ConnectionStatus.connecting;
@@ -588,6 +616,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _errorMessage = 'Máximo de tentativas de reconexão atingido';
       });
       unawaited(_releaseWifiLock());
+      unawaited(_stopForegroundService());
       return;
     }
 
@@ -646,6 +675,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _reconnectAttempt = 0;
     await _disconnect();
     await _releaseWifiLock();
+    await _stopForegroundService();
   }
 
   String _deviceName() => Platform.isIOS ? 'iPhone' : 'Android';

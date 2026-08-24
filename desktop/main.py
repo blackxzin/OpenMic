@@ -1,13 +1,16 @@
 import asyncio
 import logging
+import os
 import re
 import socket
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,10 +20,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
     QSpinBox,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -39,6 +44,115 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 _log = logging.getLogger(__name__)
+
+_APP_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_icon_path() -> Path:
+    # Running from source, the icon sits next to main.py. Running from the
+    # AppImage, main.py is frozen by PyInstaller and that relative path
+    # doesn't exist in the bundle — but the AppImage runtime sets $APPDIR to
+    # the mount point, and build_appimage.sh copies openmic.png there
+    # (alongside AppRun), so that's where it actually lives at runtime.
+    appdir = os.environ.get("APPDIR")
+    if appdir:
+        candidate = Path(appdir) / "openmic.png"
+        if candidate.exists():
+            return candidate
+    return _APP_DIR / "packaging" / "appimage" / "openmic.png"
+
+
+_ICON_PATH = _resolve_icon_path()
+_DESKTOP_ENTRY_NAME = "openmic.desktop"
+_AUTOSTART_DIR = Path.home() / ".config" / "autostart"
+_APPLICATIONS_DIR = Path.home() / ".local" / "share" / "applications"
+_ICONS_DIR = Path.home() / ".local" / "share" / "icons"
+_INSTALLED_ICON_PATH = _ICONS_DIR / "openmic.png"
+
+
+def _ensure_icon_installed() -> None:
+    """Copy the icon to a location that outlives this process.
+
+    Referencing _ICON_PATH directly in a .desktop file works for the source/
+    venv case (a stable repo path) but breaks for the AppImage case, where it
+    points inside the squashfs mount that's unmounted the moment this process
+    exits — the very next click on the launcher entry would show a blank
+    icon. Copying once to a persistent path sidesteps that regardless of how
+    this run was launched.
+    """
+    if _INSTALLED_ICON_PATH.exists() or not _ICON_PATH.exists():
+        return
+    _ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    _INSTALLED_ICON_PATH.write_bytes(_ICON_PATH.read_bytes())
+
+
+def _executable_command() -> str:
+    """The command that reopens this exact install, however it was launched.
+
+    - Inside an AppImage, sys.executable is the PyInstaller binary under the
+      squashfs mount point — that mount is torn down when this process
+      exits, so a launcher entry pointing at it would dangle immediately.
+      $APPIMAGE (set by the AppImage runtime) is the actual .AppImage file
+      path and stays valid.
+    - A raw PyInstaller build run directly (no AppImage wrapper): sys.frozen
+      is set and sys.executable is the real, persistent binary.
+    - Running from source: venv python + main.py's path.
+    """
+    appimage_path = os.environ.get("APPIMAGE")
+    if appimage_path:
+        return appimage_path
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return f"{sys.executable} {_APP_DIR / 'main.py'}"
+
+
+def _desktop_entry_contents() -> str:
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=OpenMic",
+        "Comment=Use your phone as a wireless microphone",
+        f"Exec={_executable_command()}",
+        f"Icon={_INSTALLED_ICON_PATH}",
+    ]
+    if "APPIMAGE" not in os.environ:
+        # Meaningless for the AppImage case: that mount point is gone the
+        # moment this process exits, and $APPIMAGE re-mounts fresh anyway.
+        lines.append(f"Path={_APP_DIR}")
+    lines += ["Categories=AudioVideo;Audio;", "Terminal=false", ""]
+    return "\n".join(lines)
+
+
+def _install_launcher_entry() -> None:
+    """Write the .desktop file so the app shows up in the OS app launcher.
+
+    Best-effort and silent: a missing/unwritable applications dir shouldn't
+    block the app from starting, it just means no launcher entry.
+    """
+    try:
+        _ensure_icon_installed()
+        _APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        (_APPLICATIONS_DIR / _DESKTOP_ENTRY_NAME).write_text(_desktop_entry_contents())
+    except OSError as exc:
+        _log.warning("Could not install launcher entry: %s", exc)
+
+
+def _autostart_entry_path() -> Path:
+    return _AUTOSTART_DIR / _DESKTOP_ENTRY_NAME
+
+
+def _is_autostart_enabled() -> bool:
+    return _autostart_entry_path().exists()
+
+
+def _set_autostart_enabled(enabled: bool) -> None:
+    path = _autostart_entry_path()
+    if enabled:
+        _ensure_icon_installed()
+        _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(_desktop_entry_contents() + "X-GNOME-Autostart-enabled=true\n")
+    else:
+        path.unlink(missing_ok=True)
 
 
 _IP_ADDR_LINE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)")
@@ -221,6 +335,11 @@ class MainWindow(QWidget):
         self._noise_suppression_checkbox.toggled.connect(self._on_noise_suppression_toggled)
         layout.addWidget(self._noise_suppression_checkbox)
 
+        self._autostart_checkbox = QCheckBox("Iniciar com o sistema")
+        self._autostart_checkbox.setChecked(_is_autostart_enabled())
+        self._autostart_checkbox.toggled.connect(self._on_autostart_toggled)
+        layout.addWidget(self._autostart_checkbox)
+
         # Paired devices section
         self._devices_group = QGroupBox("Dispositivos emparelhados")
         devices_layout = QVBoxLayout(self._devices_group)
@@ -247,6 +366,9 @@ class MainWindow(QWidget):
         self._refresh_device_list()
 
         self._devices_list.itemSelectionChanged.connect(self._on_device_selection_changed)
+
+        self._tray: Optional[QSystemTrayIcon] = None
+        self._setup_tray_icon()
 
     def _toggle_server(self) -> None:
         if self._server_thread is None:
@@ -319,6 +441,53 @@ class MainWindow(QWidget):
     def _on_noise_suppression_toggled(self, checked: bool) -> None:
         self._bridge.noise_suppression_enabled = checked
 
+    def _on_autostart_toggled(self, checked: bool) -> None:
+        try:
+            _set_autostart_enabled(checked)
+        except OSError as exc:
+            _log.warning("Could not update autostart entry: %s", exc)
+            self._append_log(f"Falha ao configurar início automático: {exc}")
+
+    def _setup_tray_icon(self) -> None:
+        # Not every compositor implements the systray protocol (some minimal
+        # Wayland setups don't) — fall back to the plain "closing quits"
+        # behavior instead of hiding the window into a tray icon nobody can
+        # see or click.
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        QApplication.instance().setQuitOnLastWindowClosed(False)
+
+        tray = QSystemTrayIcon(QIcon(str(_ICON_PATH)), self)
+        tray.setToolTip("OpenMic")
+
+        menu = QMenu()
+        show_action = menu.addAction("Mostrar")
+        show_action.triggered.connect(self._show_from_tray)
+        menu.addSeparator()
+        quit_action = menu.addAction("Sair")
+        quit_action.triggered.connect(self._quit)
+        tray.setContextMenu(menu)
+
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray = tray
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self) -> None:
+        self._stop_server()
+        if self._tray is not None:
+            self._tray.hide()
+        QApplication.instance().quit()
+
     def _refresh_device_list(self) -> None:
         self._devices_list.clear()
         for device in self._pairing_store.list_all():
@@ -358,12 +527,25 @@ class MainWindow(QWidget):
         self._refresh_device_list()
 
     def closeEvent(self, event) -> None:
+        if self._tray is not None:
+            # Minimize to tray instead of quitting — the server (and the
+            # phone's connection) should survive the window being closed.
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                "OpenMic",
+                "Continua rodando na bandeja. Clique no ícone para abrir de novo.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+            return
         self._stop_server()
         super().closeEvent(event)
 
 
 def main() -> None:
     app = QApplication(sys.argv)
+    _install_launcher_entry()
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
