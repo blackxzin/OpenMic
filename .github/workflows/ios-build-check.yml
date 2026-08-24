@@ -26,9 +26,14 @@ jobs:
         with:
           channel: stable
 
-      - run: flutter pub get
-
+      # clean before pub get, not after: `flutter clean` deletes
+      # ios/Flutter/Generated.xcconfig, which the Podfile's pod install
+      # step reads FLUTTER_ROOT from — running clean last left that file
+      # missing and pod install failed with "must exist ... run flutter
+      # pub get first" every time.
       - run: flutter clean
+
+      - run: flutter pub get
 
       - name: Fresh pod install
         run: |
