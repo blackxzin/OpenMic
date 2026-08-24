@@ -1,4 +1,8 @@
-platform :ios, '13.0'
+# Must stay >= the deployment target podhelper.rb bakes into the generated
+# Flutter engine podspec (currently 15.0) — a lower value here makes
+# CocoaPods refuse to resolve the Flutter pod at all ("required a higher
+# minimum deployment target").
+platform :ios, '15.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
 project 'Runner', {
@@ -45,7 +49,7 @@ post_install do |installer|
     target.build_configurations.each do |config|
       # Exclude arm64 for simulators to avoid Apple Silicon issues on CI
       config.build_settings['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = 'arm64'
-      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
     end
   end
 end
