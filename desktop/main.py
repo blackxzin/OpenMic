@@ -141,6 +141,13 @@ class ServerThread(threading.Thread):
         finally:
             if self._transport is not None:
                 self._transport.close()
+                # transport.close() only *schedules* the underlying socket's
+                # real close via call_soon; run_forever() already returned
+                # (we're here because of loop.stop()), so without this the
+                # scheduled callback never runs and loop.close() below never
+                # releases the fd — the next start then fails to rebind with
+                # "Address already in use".
+                self._loop.run_until_complete(asyncio.sleep(0))
             self._loop.close()
 
     def stop(self) -> None:

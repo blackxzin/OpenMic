@@ -36,6 +36,7 @@ class AudioBridge:
         # (which dropped most of every Opus frame).
         self._fragment = b""
         self._fragment_lock = threading.Lock()
+        self._packet_count = 0
 
     def start_output(self) -> None:
         # PortAudio caches its device list at init time, so a sink created after this
@@ -84,6 +85,11 @@ class AudioBridge:
         # Runs in packet-arrival order (single asyncio loop thread), which is
         # what the suppressor's overlap-add state requires — never call this
         # concurrently from more than one thread.
+        self._packet_count += 1
+        if self._packet_count % 100 == 1:
+            samples = np.frombuffer(pcm, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) if len(samples) else 0.0
+            _log.info("Audio packet #%d: %d bytes, input RMS=%.1f", self._packet_count, len(pcm), rms)
         processed = self._noise_suppressor.process(pcm)
         if not processed:
             return  # still filling the analysis window; nothing ready yet
