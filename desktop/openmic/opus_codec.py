@@ -29,7 +29,6 @@ class OpusDecoder:
             fs=protocol.SAMPLE_RATE,
             channels=protocol.CHANNELS,
         )
-        self._decoder.bitrate = protocol.OPUS_BITRATE
 
     @property
     def available(self) -> bool:

@@ -1,4 +1,8 @@
-platform :ios, '13.0'
+# Must stay >= the deployment target podhelper.rb bakes into the generated
+# Flutter engine podspec (currently 15.0) — a lower value here makes
+# CocoaPods refuse to resolve the Flutter pod at all ("required a higher
+# minimum deployment target").
+platform :ios, '15.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
 project 'Runner', {
@@ -6,6 +10,27 @@ project 'Runner', {
   'Profile' => :release,
   'Release' => :release,
 }
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+end
+
+# Defines flutter_ios_podfile_setup, flutter_install_all_ios_pods, and
+# flutter_additional_ios_build_settings below — without this require, calling
+# any of them raises "undefined method" since nothing in this Podfile itself
+# defines them.
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_ios_podfile_setup
 
 # Use frameworks with static linkage so vendored frameworks (like opus.framework)
 # are linked properly when building for simulator.
@@ -18,11 +43,13 @@ end
 
 post_install do |installer|
   installer.pods_project.targets.each do |target|
+    # Current Flutter podhelper split the old flutter_post_install(installer)
+    # into this per-target call — flutter_post_install doesn't exist anymore.
+    flutter_additional_ios_build_settings(target)
     target.build_configurations.each do |config|
       # Exclude arm64 for simulators to avoid Apple Silicon issues on CI
       config.build_settings['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = 'arm64'
-      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
     end
   end
-  flutter_post_install(installer)
 end
