@@ -2,3 +2,6 @@ PySide6
 sounddevice
 numpy
 zeroconf
+cryptography
+keyring
+opuslib

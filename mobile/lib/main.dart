@@ -1,10 +1,10 @@
 import 'dart:async';
-import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:opus_dart/opus_dart.dart';
 import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
@@ -13,6 +13,55 @@ import 'package:record/record.dart';
 import 'protocol.dart';
 
 const _serviceType = '_openmic._udp';
+
+/// Android-only native helpers. See MainActivity.kt for what each side does.
+const _nativeChannel = MethodChannel('dev.openmic/wifi_lock');
+
+/// Keeps the WiFi radio at full power (WIFI_MODE_FULL_HIGH_PERF) while
+/// connected/pairing — see MainActivity.kt for why this exists.
+Future<void> _acquireWifiLock() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _nativeChannel.invokeMethod('acquire');
+  } on PlatformException {
+    // Best-effort: streaming still works without it, just more exposed to
+    // the radio idling down.
+  }
+}
+
+Future<void> _releaseWifiLock() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _nativeChannel.invokeMethod('release');
+  } on PlatformException {
+    // Nothing to clean up if this fails.
+  }
+}
+
+/// Runs a foreground service with a persistent notification while streaming.
+/// Without this, Android is free to suspend mic capture in the background
+/// (screen off, app not visible) with no error surfaced anywhere — audio
+/// just silently stops, same failure class the WifiLock above fixes for the
+/// network side. Mirrors the WifiLock's lifecycle: held through reconnect
+/// attempts, released on dispose, give-up, or user-initiated disconnect.
+Future<void> _startForegroundService() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _nativeChannel.invokeMethod('startForegroundService');
+  } on PlatformException {
+    // Best-effort: streaming still works without it, just more exposed to
+    // the OS suspending capture in the background.
+  }
+}
+
+Future<void> _stopForegroundService() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _nativeChannel.invokeMethod('stopForegroundService');
+  } on PlatformException {
+    // Nothing to clean up if this fails.
+  }
+}
 
 void main() {
   runApp(const OpenMicApp());
@@ -46,6 +95,15 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   final _recorder = AudioRecorder();
 
   RawDatagramSocket? _socket;
+  // Set up once per socket and never cancelled until the socket itself
+  // closes — repeatedly cancelling/re-listening on a RawDatagramSocket
+  // between the HELLO/CHAL and PAIR_RESP/ACK steps was observed to leave the
+  // socket permanently unable to send afterwards (send() returns 0 forever,
+  // Wifi-radio-sleep and buffer-backpressure theories both ruled out on
+  // device). One persistent listener dispatching into a swappable completer
+  // avoids ever tearing down the socket's read/write registration mid-flow.
+  StreamSubscription<RawSocketEvent>? _socketSubscription;
+  Completer<Datagram?>? _pendingResponse;
   StreamSubscription<Uint8List>? _audioSubscription;
   InternetAddress? _serverAddress;
   int _serverPort = 45820;
@@ -62,10 +120,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   bool _userInitiatedDisconnect = false;
 
   // Pairing state
-  String? _pendingPin;
   Uint8List? _deviceId;
   Uint8List? _authToken;
-  bool _isPairingDialogVisible = false;
 
   // Opus encoder
   SimpleOpusEncoder? _opusEncoder;
@@ -99,20 +155,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     await discovery.initialize();
     _discoverySubscription = discovery.eventStream?.listen((event) {
       if (event is BonsoirDiscoveryServiceFoundEvent) {
-        final svc = event.service;
-        if (svc != null) {
-          svc.resolve(discovery.serviceResolver);
-        }
+        event.service.resolve(discovery.serviceResolver);
       } else if (event is BonsoirDiscoveryServiceResolvedEvent) {
         final svc = event.service;
-        if (svc != null) {
-          setState(() => _foundDevices[svc.name] = svc);
-        }
+        setState(() => _foundDevices[svc.name] = svc);
       } else if (event is BonsoirDiscoveryServiceLostEvent) {
         final svc = event.service;
-        if (svc != null) {
-          setState(() => _foundDevices.remove(svc.name));
-        }
+        setState(() => _foundDevices.remove(svc.name));
       }
     });
     await discovery.start();
@@ -129,6 +178,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   @override
   void dispose() {
     _disconnect();
+    unawaited(_releaseWifiLock());
+    unawaited(_stopForegroundService());
     _discoverySubscription?.cancel();
     _discovery?.stop();
     _ipController.dispose();
@@ -141,7 +192,11 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   Future<void> _initOpusEncoder() async {
     try {
-      final DynamicLibrary lib = await opus_flutter.load();
+      // No static type here: opus_flutter.load() returns Future<dynamic>
+      // because its actual DynamicLibrary type (dart:ffi vs web_ffi) is
+      // resolved per-platform inside opus_dart's own conditional export —
+      // annotating it dart:ffi's DynamicLibrary here fights that resolution.
+      final lib = await opus_flutter.load();
       initOpus(lib);
       _opusEncoder = SimpleOpusEncoder(
         sampleRate: Protocol.sampleRate,
@@ -155,6 +210,26 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   void _logDebug(String msg) {
     debugPrint('[OpenMic] $msg');
+  }
+
+  /// RawDatagramSocket.send() can write 0 bytes instead of throwing when the
+  /// OS isn't ready to accept the write. Note: this must NOT attach its own
+  /// listener to retry via RawSocketEvent.write — [_socket] carries exactly
+  /// one persistent listener ([_socketSubscription]) for its whole lifetime
+  /// now, and RawDatagramSocket only allows a single subscription ever. A
+  /// plain delayed retry avoids that conflict.
+  Future<void> _sendReliable(Uint8List data, InternetAddress address, int port) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    while (true) {
+      final sent = _socket!.send(data, address, port);
+      if (sent == data.length) return;
+      if (DateTime.now().isAfter(deadline)) {
+        _logDebug('send() gave up after 10s of retrying');
+        throw const SocketException('send() kept writing 0 bytes past the retry deadline');
+      }
+      _logDebug('send() wrote $sent/${data.length} bytes, retrying');
+      await Future.delayed(const Duration(milliseconds: 150));
+    }
   }
 
   Future<void> _loadStoredCredentials() async {
@@ -196,6 +271,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     // A fresh connect attempt is never user-cancelled, so auto-reconnect is
     // allowed again.
     _userInitiatedDisconnect = false;
+    await _acquireWifiLock();
+    await _startForegroundService();
 
     setState(() {
       _status = ConnectionStatus.connecting;
@@ -216,8 +293,17 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       // Never leak a prior bind: if a previous attempt's socket wasn't torn
       // down (e.g. a race between a reconnect timer and a manual connect),
       // close it before binding a fresh one.
-      await _socket?.close();
+      await _socketSubscription?.cancel();
+      _socket?.close();
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      _socketSubscription = _socket!.listen((event) {
+        if (event == RawSocketEvent.read) {
+          final d = _socket!.receive();
+          if (d != null && _pendingResponse != null && !_pendingResponse!.isCompleted) {
+            _pendingResponse!.complete(d);
+          }
+        }
+      });
 
       // Send HELLO - paired or unpaired
       Uint8List helloPacket;
@@ -226,28 +312,17 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       } else {
         helloPacket = Protocol.packHello(_deviceName());
       }
-      _socket!.send(helloPacket, _serverAddress!, _serverPort);
+      await _sendReliable(helloPacket, _serverAddress!, _serverPort);
 
       // Wait for response (challenge, ack, or pairing challenge)
-      final completer = Completer<Datagram?>();
-      late final StreamSubscription<RawSocketEvent> sub;
-      sub = _socket!.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final d = _socket!.receive();
-          if (d != null && !completer.isCompleted) {
-            completer.complete(d);
-          }
-        }
-      });
-
-      final response = await completer.future.timeout(
+      _pendingResponse = Completer<Datagram?>();
+      final response = await _pendingResponse!.future.timeout(
         const Duration(seconds: 5),
         onTimeout: () {
-          if (!completer.isCompleted) completer.complete(null);
+          if (!_pendingResponse!.isCompleted) _pendingResponse!.complete(null);
+          return null;
         },
       );
-
-      await sub.cancel();
 
       if (response == null) {
         throw Exception('Servidor não respondeu — verifique o IP e porta');
@@ -304,7 +379,6 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   Future<void> _showPairingDialog(String pin) async {
     setState(() {
-      _pendingPin = pin;
       _status = ConnectionStatus.pairing;
     });
 
@@ -346,32 +420,21 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     if (confirmed == true) {
       // Send PAIR_RESP, echoing the PIN so the desktop can verify the user
       // really entered the same code on the phone.
-      _socket!.send(
-        Protocol.packPairResponse(pin),
-        _serverAddress!,
-        _serverPort,
-      );
+      await _sendReliable(Protocol.packPairResponse(pin), _serverAddress!, _serverPort);
 
       // Wait for PAIR_ACK
-      final completer = Completer<Datagram?>();
-      late final StreamSubscription<RawSocketEvent> sub;
-      sub = _socket!.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final d = _socket!.receive();
-          if (d != null && !completer.isCompleted) {
-            completer.complete(d);
-          }
-        }
-      });
-
-      final ack = await completer.future.timeout(
+      _pendingResponse = Completer<Datagram?>();
+      final ack = await _pendingResponse!.future.timeout(
         const Duration(seconds: 5),
         onTimeout: () {
-          if (!completer.isCompleted) completer.complete(null);
+          if (!_pendingResponse!.isCompleted) _pendingResponse!.complete(null);
+          return null;
         },
       );
 
-      await sub.cancel();
+      if (ack == null) {
+        _logDebug('PAIR_ACK wait timed out — no response from server');
+      }
 
       if (ack != null) {
         final parsed = Protocol.unpack(ack.data);
@@ -382,6 +445,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
           _startStreaming();
           return;
         }
+        _logDebug('PAIR_ACK response did not parse as expected: $parsed');
       }
       throw Exception('Falha ao confirmar emparelhamento');
     } else {
@@ -407,6 +471,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         encoder: AudioEncoder.pcm16bits,
         sampleRate: Protocol.sampleRate,
         numChannels: Protocol.channels,
+        // Best-effort: uses the platform's native noise suppressor (Android
+        // NoiseSuppressor effect / iOS voice processing) when the device
+        // supports it. No-op otherwise — never throws.
+        noiseSuppress: true,
       ),
     );
     audioStream.then((stream) {
@@ -446,9 +514,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     // 960-sample window. Any trailing partial samples stay buffered.
     _pcmBuffer.addAll(pcmChunk);
     while (_pcmBuffer.length >= frameSamples * 2) {
-      final frame = Int16List.fromList(
+      // Decode little-endian byte pairs into int16 samples (matches the
+      // desktop's np.frombuffer(dtype=int16) reader) — Int16List.fromList
+      // would instead treat each raw byte as a whole sample, corrupting audio.
+      final frameBytes = Uint8List.fromList(
         _pcmBuffer.sublist(0, frameSamples * 2),
       );
+      final frame = Int16List.view(frameBytes.buffer, 0, frameSamples);
       _pcmBuffer.removeRange(0, frameSamples * 2);
 
       try {
@@ -498,16 +570,13 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     if (sampleCount == 0) return;
 
     double sumSquares = 0.0;
-    // Iterate whole int16 samples to avoid an out-of-bounds read on an odd
-    // trailing byte.
-    final Int16List samples = Int16List.view(
-      pcmChunk.buffer,
-      pcmChunk.offsetInBytes,
-      sampleCount,
-    );
+    // ByteData reads are unaligned, unlike Int16List.view — the record plugin's
+    // chunk can start at an odd offsetInBytes into its underlying buffer, which
+    // made Int16List.view throw RangeError on every chunk (silently killing
+    // audio before it reached the encoder/socket).
+    final ByteData samples = ByteData.sublistView(pcmChunk);
     for (int i = 0; i < sampleCount; i++) {
-      // Int16List gives the signed value directly (little-endian host order).
-      final double normalized = samples[i] / 32768.0;
+      final double normalized = samples.getInt16(i * 2, Endian.little) / 32768.0;
       sumSquares += normalized * normalized;
     }
     final double rms = sampleCount > 0 ? (sumSquares / sampleCount) : 0.0;
@@ -546,6 +615,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _status = ConnectionStatus.error;
         _errorMessage = 'Máximo de tentativas de reconexão atingido';
       });
+      unawaited(_releaseWifiLock());
+      unawaited(_stopForegroundService());
       return;
     }
 
@@ -582,9 +653,12 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     if (_socket != null && _serverAddress != null) {
       _socket!.send(Protocol.packBye(), _serverAddress!, _serverPort);
     }
+    await _socketSubscription?.cancel();
+    _socketSubscription = null;
     _socket?.close();
     _socket = null;
     _serverAddress = null;
+    _pendingResponse = null;
 
     if (mounted) {
       setState(() {
@@ -600,6 +674,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     _reconnectTimer = null;
     _reconnectAttempt = 0;
     await _disconnect();
+    await _releaseWifiLock();
+    await _stopForegroundService();
   }
 
   String _deviceName() => Platform.isIOS ? 'iPhone' : 'Android';
@@ -860,7 +936,7 @@ class _VuMeter extends StatelessWidget {
                       bottom: 0,
                       child: Container(
                         width: 4,
-                        color: Colors.white.withOpacity(0.7),
+                        color: Colors.white.withValues(alpha: 0.7),
                       ),
                     ),
                 ],
