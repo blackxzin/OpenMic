@@ -22,6 +22,32 @@ class Protocol {
   static const int opusFrameSizeMs = 20;
   static const int opusFrameSamples = 960;  // 48000 * 20 / 1000
 
+  // Selectable quality presets. Only the encoder needs to know the bitrate:
+  // an Opus frame carries its own configuration, so the desktop decodes any
+  // of these without being told which one is in use.
+  static const int opusBitrateMin = 12000;
+  static const int opusBitrateMax = 64000;
+  static const List<int> opusBitratePresets = <int>[16000, 24000, 48000];
+
+  /// Keep a requested bitrate inside the range libopus handles for voice.
+  static int clampBitrate(int value) {
+    if (value < opusBitrateMin) return opusBitrateMin;
+    if (value > opusBitrateMax) return opusBitrateMax;
+    return value;
+  }
+
+  /// Output-buffer size that caps one frame at [bitrate].
+  ///
+  /// opus_dart 3.x exposes no OPUS_SET_BITRATE control, but libopus treats
+  /// the output buffer it is handed as a hard ceiling for that frame and
+  /// lowers quality to fit — so sizing the buffer per frame is how the
+  /// quality presets are actually enforced. It is a ceiling, not a target:
+  /// quiet audio still encodes smaller.
+  static int maxFrameBytesFor(int bitrate) {
+    final framesPerSecond = 1000 ~/ opusFrameSizeMs;
+    return clampBitrate(bitrate) ~/ 8 ~/ framesPerSecond;
+  }
+
   static const int deviceIdLen = 16;
   static const int authTokenLen = 16;
   static const int pinLen = 6;

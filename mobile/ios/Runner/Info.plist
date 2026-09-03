@@ -34,6 +34,14 @@
 	<array>
 		<string>_openmic._udp.</string>
 	</array>
+	<!-- Without the audio background mode, iOS suspends the capture session
+	     when the screen locks or the user switches apps, and the stream dies
+	     with nothing surfaced in the UI. This is the iOS counterpart of the
+	     Android foreground service. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
