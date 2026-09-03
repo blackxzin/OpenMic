@@ -1,0 +1,60 @@
+# Maintainer: OpenMic contributors
+#
+# Runs the app from source against the distro's own Python packages instead of
+# a PyInstaller bundle — that is what Arch users expect, and it keeps PySide6
+# in step with the system Qt.
+pkgname=openmic
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Use your phone as a wireless microphone over WiFi"
+arch=('any')
+url="https://github.com/blackxzin/OpenMic"
+license=('MIT')
+depends=(
+  'python'
+  'pyside6'
+  'python-sounddevice'
+  'python-numpy'
+  'python-zeroconf'
+  'python-cryptography'
+  'python-keyring'
+  'opus'
+  'portaudio'
+  # pactl, used to create the virtual microphone
+  'libpulse'
+  # From the AUR, not the official repos. Not optional: the phone streams
+  # Opus, so without this the desktop decodes nothing at all.
+  'python-opuslib'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/OpenMic-$pkgver/desktop"
+
+  install -d "$pkgdir/usr/share/openmic"
+  cp -r main.py openmic "$pkgdir/usr/share/openmic/"
+  find "$pkgdir/usr/share/openmic" -name '__pycache__' -type d -exec rm -rf {} +
+
+  install -Dm755 /dev/stdin "$pkgdir/usr/bin/openmic" <<'LAUNCHER'
+#!/bin/sh
+exec python /usr/share/openmic/main.py "$@"
+LAUNCHER
+
+  install -Dm644 packaging/appimage/openmic.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/openmic.png"
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/openmic.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=OpenMic
+Comment=Use your phone as a wireless microphone
+Exec=/usr/bin/openmic
+Icon=openmic
+Categories=AudioVideo;Audio;
+Terminal=false
+DESKTOP
+
+  install -Dm644 "$srcdir/OpenMic-$pkgver/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

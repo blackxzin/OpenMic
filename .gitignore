@@ -1,6 +1,8 @@
 desktop/.venv/
 __pycache__/
 *.pyc
+.coverage
+htmlcov/
 
 # PyInstaller/AppImage build output — build with packaging/build_appimage.sh
 desktop/build/

@@ -28,9 +28,27 @@ if [ ! -x "$APPIMAGETOOL" ]; then
     chmod +x "$APPIMAGETOOL"
 fi
 
+# opuslib and sounddevice both dlopen their C library by name at runtime, so
+# PyInstaller has no import to follow and bundles neither. Without these the
+# AppImage only runs on hosts that already have libopus/PortAudio installed —
+# and opuslib raises during import when libopus is missing.
+ADD_BINARY_ARGS=()
+for lib in libopus.so.0 libportaudio.so.2; do
+    # No early `exit` in awk: closing the pipe kills ldconfig with SIGPIPE,
+    # which `set -o pipefail` turns into a failed build.
+    path="$(ldconfig -p | awk -v lib="$lib" '$1 == lib && !seen { print $NF; seen = 1 }')"
+    if [ -n "$path" ] && [ -e "$path" ]; then
+        echo "Bundling $lib from $path"
+        ADD_BINARY_ARGS+=(--add-binary "$path:.")
+    else
+        echo "warning: $lib not found on this machine — the AppImage will need it installed" >&2
+    fi
+done
+
 echo "Bundling with PyInstaller..."
 rm -rf build dist OpenMic.spec
-"$VENV_PYINSTALLER" --name OpenMic --onedir --windowed --noconfirm main.py
+"$VENV_PYINSTALLER" --name OpenMic --onedir --windowed --noconfirm \
+    "${ADD_BINARY_ARGS[@]}" main.py
 
 echo "Assembling AppDir..."
 rm -rf AppDir

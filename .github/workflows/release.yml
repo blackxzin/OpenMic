@@ -60,7 +60,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgl1 libegl1
+        # libopus0/libportaudio2 are bundled into the AppImage by
+        # build_appimage.sh, so they have to exist on the builder.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libopus0 libportaudio2
 
       - working-directory: desktop
         run: |
@@ -76,10 +80,19 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: ./packaging/build_appimage.sh
 
+      - name: Build .deb
+        working-directory: desktop
+        run: ./packaging/build_deb.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
           path: desktop/dist/OpenMic-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: desktop/dist/*.deb
 
   check-ios-still-builds:
     runs-on: macos-latest
@@ -108,6 +121,11 @@ jobs:
           name: linux-appimage
           path: release-assets
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-deb
+          path: release-assets
+
       - name: Rename assets
         working-directory: release-assets
         run: mv app-release.apk OpenMic.apk
@@ -117,4 +135,5 @@ jobs:
           files: |
             release-assets/OpenMic.apk
             release-assets/OpenMic-x86_64.AppImage
+            release-assets/openmic_*_amd64.deb
           generate_release_notes: true
