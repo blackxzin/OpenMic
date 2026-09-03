@@ -33,9 +33,9 @@ class TestServerThreadRestart(unittest.TestCase):
         bridge = AudioBridge("OpenMicSink")
         signals = main.ServerSignals()
         errors: list[str] = []
-        signals.log_message.connect(
-            lambda msg: errors.append(msg) if "Erro" in msg or "Endereço" in msg else None
-        )
+        # A dedicated signal, so this assertion doesn't depend on the
+        # language the log happens to be translated into.
+        signals.error_message.connect(errors.append)
 
         for _ in range(3):
             thread = main.ServerThread("127.0.0.1", _TEST_PORT, bridge, signals)

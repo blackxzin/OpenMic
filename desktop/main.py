@@ -1,23 +1,19 @@
+"""OpenMic desktop app: virtual microphone fed by the phone over WiFi."""
+
 import asyncio
 import logging
-import os
-import re
-import socket
-import subprocess
 import sys
 import threading
-from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
+    QCheckBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QCheckBox,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -31,12 +27,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openmic import desktop_entry
 from openmic.discovery import ServiceAdvertiser
+from openmic.i18n import tr
+from openmic.net_ifaces import get_local_ips
+from openmic.pairing import PairingStore
 from openmic.server import AudioBridge, run_server
 from openmic.virtual_mic import VirtualMic, VirtualMicError
-from openmic.pairing import PairingStore
 
 DEFAULT_PORT = 45820
+STATS_REFRESH_MS = 1000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,172 +45,13 @@ logging.basicConfig(
 )
 _log = logging.getLogger(__name__)
 
-_APP_DIR = Path(__file__).resolve().parent
-
-
-def _resolve_icon_path() -> Path:
-    # Running from source, the icon sits next to main.py. Running from the
-    # AppImage, main.py is frozen by PyInstaller and that relative path
-    # doesn't exist in the bundle — but the AppImage runtime sets $APPDIR to
-    # the mount point, and build_appimage.sh copies openmic.png there
-    # (alongside AppRun), so that's where it actually lives at runtime.
-    appdir = os.environ.get("APPDIR")
-    if appdir:
-        candidate = Path(appdir) / "openmic.png"
-        if candidate.exists():
-            return candidate
-    return _APP_DIR / "packaging" / "appimage" / "openmic.png"
-
-
-_ICON_PATH = _resolve_icon_path()
-_DESKTOP_ENTRY_NAME = "openmic.desktop"
-_AUTOSTART_DIR = Path.home() / ".config" / "autostart"
-_APPLICATIONS_DIR = Path.home() / ".local" / "share" / "applications"
-_ICONS_DIR = Path.home() / ".local" / "share" / "icons"
-_INSTALLED_ICON_PATH = _ICONS_DIR / "openmic.png"
-
-
-def _ensure_icon_installed() -> None:
-    """Copy the icon to a location that outlives this process.
-
-    Referencing _ICON_PATH directly in a .desktop file works for the source/
-    venv case (a stable repo path) but breaks for the AppImage case, where it
-    points inside the squashfs mount that's unmounted the moment this process
-    exits — the very next click on the launcher entry would show a blank
-    icon. Copying once to a persistent path sidesteps that regardless of how
-    this run was launched.
-    """
-    if _INSTALLED_ICON_PATH.exists() or not _ICON_PATH.exists():
-        return
-    _ICONS_DIR.mkdir(parents=True, exist_ok=True)
-    _INSTALLED_ICON_PATH.write_bytes(_ICON_PATH.read_bytes())
-
-
-def _executable_command() -> str:
-    """The command that reopens this exact install, however it was launched.
-
-    - Inside an AppImage, sys.executable is the PyInstaller binary under the
-      squashfs mount point — that mount is torn down when this process
-      exits, so a launcher entry pointing at it would dangle immediately.
-      $APPIMAGE (set by the AppImage runtime) is the actual .AppImage file
-      path and stays valid.
-    - A raw PyInstaller build run directly (no AppImage wrapper): sys.frozen
-      is set and sys.executable is the real, persistent binary.
-    - Running from source: venv python + main.py's path.
-    """
-    appimage_path = os.environ.get("APPIMAGE")
-    if appimage_path:
-        return appimage_path
-    if getattr(sys, "frozen", False):
-        return sys.executable
-    return f"{sys.executable} {_APP_DIR / 'main.py'}"
-
-
-def _desktop_entry_contents() -> str:
-    lines = [
-        "[Desktop Entry]",
-        "Type=Application",
-        "Name=OpenMic",
-        "Comment=Use your phone as a wireless microphone",
-        f"Exec={_executable_command()}",
-        f"Icon={_INSTALLED_ICON_PATH}",
-    ]
-    if "APPIMAGE" not in os.environ:
-        # Meaningless for the AppImage case: that mount point is gone the
-        # moment this process exits, and $APPIMAGE re-mounts fresh anyway.
-        lines.append(f"Path={_APP_DIR}")
-    lines += ["Categories=AudioVideo;Audio;", "Terminal=false", ""]
-    return "\n".join(lines)
-
-
-def _install_launcher_entry() -> None:
-    """Write the .desktop file so the app shows up in the OS app launcher.
-
-    Best-effort and silent: a missing/unwritable applications dir shouldn't
-    block the app from starting, it just means no launcher entry.
-    """
-    try:
-        _ensure_icon_installed()
-        _APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
-        (_APPLICATIONS_DIR / _DESKTOP_ENTRY_NAME).write_text(_desktop_entry_contents())
-    except OSError as exc:
-        _log.warning("Could not install launcher entry: %s", exc)
-
-
-def _autostart_entry_path() -> Path:
-    return _AUTOSTART_DIR / _DESKTOP_ENTRY_NAME
-
-
-def _is_autostart_enabled() -> bool:
-    return _autostart_entry_path().exists()
-
-
-def _set_autostart_enabled(enabled: bool) -> None:
-    path = _autostart_entry_path()
-    if enabled:
-        _ensure_icon_installed()
-        _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(_desktop_entry_contents() + "X-GNOME-Autostart-enabled=true\n")
-    else:
-        path.unlink(missing_ok=True)
-
-
-_IP_ADDR_LINE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)")
-
-# Virtual interfaces created by container/VM tooling never reach the phone —
-# they're isolated bridge networks local to this machine (Docker, Podman,
-# libvirt, VPNs). Surfacing one of these as the "use this" IP produces an
-# address the phone can never connect to.
-_VIRTUAL_IFACE_PREFIXES = ("docker", "br-", "veth", "virbr", "vmnet", "podman", "tun", "tap")
-
-
-def _is_virtual_iface(name: str) -> bool:
-    return name.startswith(_VIRTUAL_IFACE_PREFIXES)
-
-
-def get_local_ips() -> list[str]:
-    """Local IPv4 addresses, WiFi interfaces first.
-
-    Picking "whichever interface handles outbound internet traffic" doesn't
-    work here: this machine's default route can go over a wired/USB interface
-    while the phone is only reachable over WiFi. Interface *names* are a much
-    more reliable signal than routing — Linux's predictable naming scheme
-    prefixes wireless interfaces with "wl" (wlp1s0, wlan0, ...), unlike wired/
-    USB-ethernet ("en...") or other interfaces.
-    """
-    by_iface: dict[str, str] = {}
-    try:
-        result = subprocess.run(
-            ["ip", "-4", "-o", "addr", "show"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        for line in result.stdout.splitlines():
-            match = _IP_ADDR_LINE.match(line)
-            if match:
-                iface, ip = match.groups()
-                if ip.startswith("127.") or _is_virtual_iface(iface):
-                    continue
-                by_iface[iface] = ip
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    if not by_iface:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-                probe.connect(("8.8.8.8", 80))
-                return [probe.getsockname()[0]]
-        except OSError:
-            return ["127.0.0.1"]
-
-    wifi_ips = sorted(ip for iface, ip in by_iface.items() if iface.startswith("wl"))
-    other_ips = sorted(ip for iface, ip in by_iface.items() if not iface.startswith("wl"))
-    return wifi_ips + other_ips or ["127.0.0.1"]
-
 
 class ServerSignals(QObject):
     log_message = Signal(str)
+    # Errors travel on their own signal instead of being pattern-matched out
+    # of the log text — the log is translated, so matching on wording would
+    # break in whichever language the string isn't written in.
+    error_message = Signal(str)
     device_connected = Signal(str, str)
     device_disconnected = Signal(str)
     pairing_request = Signal(str, str)  # IP, PIN
@@ -247,11 +88,11 @@ class ServerThread(threading.Thread):
                 run_server(self._host, self._port, self._bridge, on_hello, on_bye, on_pairing_request)
             )
             _log.info("Listening on %s:%d (UDP)", self._host, self._port)
-            self._signals.log_message.emit(f"Ouvindo em {self._host}:{self._port} (UDP)")
+            self._signals.log_message.emit(tr("log_listening", host=self._host, port=self._port))
             self._loop.run_forever()
         except OSError as exc:
             _log.error("Failed to start server: %s", exc)
-            self._signals.log_message.emit(f"Erro ao iniciar servidor: {exc}")
+            self._signals.error_message.emit(tr("error_server", error=exc))
         finally:
             if self._transport is not None:
                 self._transport.close()
@@ -273,7 +114,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OpenMic")
-        self.resize(420, 560)
+        self.resize(420, 640)
 
         self._virtual_mic = VirtualMic()
         self._bridge = AudioBridge(sink_device_name="OpenMicSink")
@@ -284,80 +125,36 @@ class MainWindow(QWidget):
 
         self._signals = ServerSignals()
         self._signals.log_message.connect(self._append_log)
+        self._signals.error_message.connect(self._append_log)
         self._signals.device_connected.connect(self._on_device_connected)
         self._signals.device_disconnected.connect(self._on_device_disconnected)
         self._signals.pairing_request.connect(self._on_pairing_request)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(self._build_address_group())
+        layout.addLayout(self._build_port_row())
 
-        ip_group = QGroupBox("Endereço deste computador")
-        ip_layout = QVBoxLayout(ip_group)
-        for index, ip in enumerate(self._local_ips):
-            label = f"{ip} (usar este)" if index == 0 else ip
-            ip_layout.addWidget(QLabel(label))
-        layout.addWidget(ip_group)
-
-        port_row = QHBoxLayout()
-        port_row.addWidget(QLabel("Porta:"))
-        self._port_spin = QSpinBox()
-        self._port_spin.setRange(1024, 65535)
-        self._port_spin.setValue(DEFAULT_PORT)
-        port_row.addWidget(self._port_spin)
-        layout.addLayout(port_row)
-
-        self._toggle_button = QPushButton("Iniciar servidor")
+        self._toggle_button = QPushButton(tr("start_server"))
         self._toggle_button.clicked.connect(self._toggle_server)
         layout.addWidget(self._toggle_button)
 
-        self._status_label = QLabel("Desligado")
+        self._status_label = QLabel(tr("status_off"))
         layout.addWidget(self._status_label)
 
-        # Volume/gain control
-        gain_group = QGroupBox("Ganho do microfone")
-        gain_layout = QVBoxLayout(gain_group)
+        layout.addWidget(self._build_quality_group())
+        layout.addWidget(self._build_gain_group())
 
-        self._gain_slider = QSlider(Qt.Horizontal)
-        self._gain_slider.setRange(0, 500)  # 0% to 500%
-        self._gain_slider.setValue(100)      # 100% = 1.0x
-        self._gain_slider.setTickPosition(QSlider.TicksBelow)
-        self._gain_slider.setTickInterval(50)
-        self._gain_slider.valueChanged.connect(self._on_gain_changed)
-        gain_layout.addWidget(self._gain_slider)
-
-        self._gain_label = QLabel("100%")
-        self._gain_label.setAlignment(Qt.AlignCenter)
-        gain_layout.addWidget(self._gain_label)
-
-        layout.addWidget(gain_group)
-
-        self._noise_suppression_checkbox = QCheckBox("Redução de ruído de fundo")
+        self._noise_suppression_checkbox = QCheckBox(tr("noise_suppression"))
         self._noise_suppression_checkbox.setChecked(True)
         self._noise_suppression_checkbox.toggled.connect(self._on_noise_suppression_toggled)
         layout.addWidget(self._noise_suppression_checkbox)
 
-        self._autostart_checkbox = QCheckBox("Iniciar com o sistema")
-        self._autostart_checkbox.setChecked(_is_autostart_enabled())
+        self._autostart_checkbox = QCheckBox(tr("autostart"))
+        self._autostart_checkbox.setChecked(desktop_entry.is_autostart_enabled())
         self._autostart_checkbox.toggled.connect(self._on_autostart_toggled)
         layout.addWidget(self._autostart_checkbox)
 
-        # Paired devices section
-        self._devices_group = QGroupBox("Dispositivos emparelhados")
-        devices_layout = QVBoxLayout(self._devices_group)
-        self._devices_list = QListWidget()
-        self._devices_list.setMaximumHeight(80)
-        devices_layout.addWidget(self._devices_list)
-
-        devices_buttons = QHBoxLayout()
-        self._unpair_button = QPushButton("Remover selecionado")
-        self._unpair_button.clicked.connect(self._unpair_selected)
-        self._unpair_button.setEnabled(False)
-        self._unpair_all_button = QPushButton("Remover todos")
-        self._unpair_all_button.clicked.connect(self._unpair_all)
-        self._unpair_all_button.setEnabled(False)
-        devices_buttons.addWidget(self._unpair_button)
-        devices_buttons.addWidget(self._unpair_all_button)
-        devices_layout.addLayout(devices_buttons)
-        layout.addWidget(self._devices_group)
+        layout.addWidget(self._build_devices_group())
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
@@ -365,10 +162,80 @@ class MainWindow(QWidget):
 
         self._refresh_device_list()
 
-        self._devices_list.itemSelectionChanged.connect(self._on_device_selection_changed)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(STATS_REFRESH_MS)
+        self._stats_timer.timeout.connect(self._refresh_stats)
 
         self._tray: Optional[QSystemTrayIcon] = None
         self._setup_tray_icon()
+
+    # ---------------------------------------------------------------- layout
+
+    def _build_address_group(self) -> QGroupBox:
+        group = QGroupBox(tr("group_address"))
+        group_layout = QVBoxLayout(group)
+        for index, ip in enumerate(self._local_ips):
+            label = tr("use_this_address", ip=ip) if index == 0 else ip
+            group_layout.addWidget(QLabel(label))
+        return group
+
+    def _build_port_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("port")))
+        self._port_spin = QSpinBox()
+        self._port_spin.setRange(1024, 65535)
+        self._port_spin.setValue(DEFAULT_PORT)
+        row.addWidget(self._port_spin)
+        return row
+
+    def _build_quality_group(self) -> QGroupBox:
+        group = QGroupBox(tr("group_quality"))
+        group_layout = QVBoxLayout(group)
+        self._quality_label = QLabel(tr("quality_idle"))
+        self._quality_detail_label = QLabel("")
+        self._quality_detail_label.setEnabled(False)  # secondary, dimmed
+        group_layout.addWidget(self._quality_label)
+        group_layout.addWidget(self._quality_detail_label)
+        return group
+
+    def _build_gain_group(self) -> QGroupBox:
+        group = QGroupBox(tr("group_gain"))
+        group_layout = QVBoxLayout(group)
+
+        self._gain_slider = QSlider(Qt.Horizontal)
+        self._gain_slider.setRange(0, 500)  # 0% to 500%
+        self._gain_slider.setValue(100)      # 100% = 1.0x
+        self._gain_slider.setTickPosition(QSlider.TicksBelow)
+        self._gain_slider.setTickInterval(50)
+        self._gain_slider.valueChanged.connect(self._on_gain_changed)
+        group_layout.addWidget(self._gain_slider)
+
+        self._gain_label = QLabel("100%")
+        self._gain_label.setAlignment(Qt.AlignCenter)
+        group_layout.addWidget(self._gain_label)
+        return group
+
+    def _build_devices_group(self) -> QGroupBox:
+        group = QGroupBox(tr("group_devices"))
+        group_layout = QVBoxLayout(group)
+        self._devices_list = QListWidget()
+        self._devices_list.setMaximumHeight(80)
+        self._devices_list.itemSelectionChanged.connect(self._on_device_selection_changed)
+        group_layout.addWidget(self._devices_list)
+
+        buttons = QHBoxLayout()
+        self._unpair_button = QPushButton(tr("remove_selected"))
+        self._unpair_button.clicked.connect(self._unpair_selected)
+        self._unpair_button.setEnabled(False)
+        self._unpair_all_button = QPushButton(tr("remove_all"))
+        self._unpair_all_button.clicked.connect(self._unpair_all)
+        self._unpair_all_button.setEnabled(False)
+        buttons.addWidget(self._unpair_button)
+        buttons.addWidget(self._unpair_all_button)
+        group_layout.addLayout(buttons)
+        return group
+
+    # --------------------------------------------------------------- server
 
     def _toggle_server(self) -> None:
         if self._server_thread is None:
@@ -382,14 +249,14 @@ class MainWindow(QWidget):
             _log.info("Virtual microphone created")
         except VirtualMicError as exc:
             _log.error("Failed to create virtual mic: %s", exc)
-            self._append_log(f"Falha ao criar microfone virtual: {exc}")
+            self._append_log(tr("error_virtual_mic", error=exc))
             return
         try:
             self._bridge.start_output()
             _log.info("Audio output started")
         except RuntimeError as exc:
             _log.error("Failed to open audio output: %s", exc)
-            self._append_log(f"Falha ao abrir saída de áudio: {exc}")
+            self._append_log(tr("error_audio_output", error=exc))
             self._virtual_mic.destroy()
             return
 
@@ -400,10 +267,11 @@ class MainWindow(QWidget):
         if self._local_ips:
             self._advertiser.start(port=port, ip=self._local_ips[0])
             _log.info("mDNS advertising started on %s:%d", self._local_ips[0], port)
-            self._append_log("Anunciando na rede via mDNS (descoberta automática)")
+            self._append_log(tr("log_mdns"))
 
-        self._toggle_button.setText("Parar servidor")
-        self._status_label.setText("Aguardando conexão do celular...")
+        self._stats_timer.start()
+        self._toggle_button.setText(tr("stop_server"))
+        self._status_label.setText(tr("status_waiting"))
 
     def _stop_server(self) -> None:
         if self._server_thread is not None:
@@ -413,29 +281,60 @@ class MainWindow(QWidget):
         self._advertiser.stop()
         self._bridge.stop_output()
         self._virtual_mic.destroy()
+        self._stats_timer.stop()
+        self._reset_quality_labels()
         _log.info("Server stopped")
-        self._toggle_button.setText("Iniciar servidor")
-        self._status_label.setText("Desligado")
+        self._toggle_button.setText(tr("start_server"))
+        self._status_label.setText(tr("status_off"))
+
+    # ---------------------------------------------------------------- stats
+
+    def _refresh_stats(self) -> None:
+        stats = self._bridge.stats()
+        if not stats.receiving:
+            self._reset_quality_labels()
+            return
+        self._quality_label.setText(
+            tr(
+                "quality_line",
+                bitrate=stats.bitrate_kbps,
+                loss=stats.loss_percent,
+                jitter=stats.jitter_ms,
+            )
+        )
+        self._quality_detail_label.setText(
+            tr(
+                "quality_detail",
+                buffer=stats.buffer_ms,
+                packets=stats.packets,
+                lost=stats.lost,
+            )
+        )
+
+    def _reset_quality_labels(self) -> None:
+        self._quality_label.setText(tr("quality_idle"))
+        self._quality_detail_label.setText("")
+
+    # ------------------------------------------------------------- signals
 
     def _append_log(self, message: str) -> None:
         self._log.append(message)
 
     def _on_device_connected(self, ip: str, name: str) -> None:
-        self._status_label.setText(f"Conectado: {name} ({ip})")
-        self._append_log(f"Dispositivo conectado: {name} ({ip})")
+        self._status_label.setText(tr("status_connected", name=name, ip=ip))
+        self._append_log(tr("log_device_connected", name=name, ip=ip))
 
     def _on_device_disconnected(self, ip: str) -> None:
-        self._status_label.setText("Aguardando conexão do celular...")
-        self._append_log(f"Dispositivo desconectado: {ip}")
+        self._status_label.setText(tr("status_waiting"))
+        self._append_log(tr("log_device_disconnected", ip=ip))
 
     def _on_pairing_request(self, ip: str, pin: str) -> None:
-        self._status_label.setText(f"Emparelhar: {pin}")
-        self._append_log(f"Solicitação de emparelhamento de {ip} — PIN: {pin}")
+        self._status_label.setText(tr("status_pairing", pin=pin))
+        self._append_log(tr("log_pairing_request", ip=ip, pin=pin))
 
     def _on_gain_changed(self, value: int) -> None:
         # value is 0-500, represents percentage
-        gain = value / 100.0
-        self._bridge.gain = gain
+        self._bridge.gain = value / 100.0
         self._gain_label.setText(f"{value}%")
 
     def _on_noise_suppression_toggled(self, checked: bool) -> None:
@@ -443,10 +342,12 @@ class MainWindow(QWidget):
 
     def _on_autostart_toggled(self, checked: bool) -> None:
         try:
-            _set_autostart_enabled(checked)
+            desktop_entry.set_autostart_enabled(checked)
         except OSError as exc:
             _log.warning("Could not update autostart entry: %s", exc)
-            self._append_log(f"Falha ao configurar início automático: {exc}")
+            self._append_log(tr("error_autostart", error=exc))
+
+    # ------------------------------------------------------------------ tray
 
     def _setup_tray_icon(self) -> None:
         # Not every compositor implements the systray protocol (some minimal
@@ -458,14 +359,14 @@ class MainWindow(QWidget):
 
         QApplication.instance().setQuitOnLastWindowClosed(False)
 
-        tray = QSystemTrayIcon(QIcon(str(_ICON_PATH)), self)
+        tray = QSystemTrayIcon(QIcon(str(desktop_entry.ICON_PATH)), self)
         tray.setToolTip("OpenMic")
 
         menu = QMenu()
-        show_action = menu.addAction("Mostrar")
+        show_action = menu.addAction(tr("tray_show"))
         show_action.triggered.connect(self._show_from_tray)
         menu.addSeparator()
-        quit_action = menu.addAction("Sair")
+        quit_action = menu.addAction(tr("tray_quit"))
         quit_action.triggered.connect(self._quit)
         tray.setContextMenu(menu)
 
@@ -488,14 +389,15 @@ class MainWindow(QWidget):
             self._tray.hide()
         QApplication.instance().quit()
 
+    # --------------------------------------------------------------- devices
+
     def _refresh_device_list(self) -> None:
         self._devices_list.clear()
         for device in self._pairing_store.list_all():
             item = QListWidgetItem(f"{device['name']} ({device['device_id'][:8]}...)")
             item.setData(Qt.UserRole, device["device_id"])
             self._devices_list.addItem(item)
-        has_devices = self._devices_list.count() > 0
-        self._unpair_all_button.setEnabled(has_devices)
+        self._unpair_all_button.setEnabled(self._devices_list.count() > 0)
 
     def _on_device_selection_changed(self) -> None:
         self._unpair_button.setEnabled(len(self._devices_list.selectedItems()) > 0)
@@ -503,27 +405,25 @@ class MainWindow(QWidget):
     def _unpair_selected(self) -> None:
         for item in self._devices_list.selectedItems():
             device_id_hex = item.data(Qt.UserRole)
-            device_id = bytes.fromhex(device_id_hex)
             name = item.text().split(" (")[0]
-            self._pairing_store.remove(device_id)
+            self._pairing_store.remove(bytes.fromhex(device_id_hex))
             _log.info("Unpaired device: %s (%s...)", name, device_id_hex[:8])
-            self._append_log(f"Dispositivo desemparelhado: {name}")
+            self._append_log(tr("log_unpaired", name=name))
         self._refresh_device_list()
 
     def _unpair_all(self) -> None:
         reply = QMessageBox.question(
             self,
-            "Confirmar",
-            "Remover todos os dispositivos emparelhados?",
+            tr("confirm_title"),
+            tr("confirm_unpair_all"),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
         for device in self._pairing_store.list_all():
-            device_id = bytes.fromhex(device["device_id"])
-            self._pairing_store.remove(device_id)
-        self._append_log("Todos os dispositivos foram desemparelhados")
+            self._pairing_store.remove(bytes.fromhex(device["device_id"]))
+        self._append_log(tr("log_unpaired_all"))
         self._refresh_device_list()
 
     def closeEvent(self, event) -> None:
@@ -534,7 +434,7 @@ class MainWindow(QWidget):
             self.hide()
             self._tray.showMessage(
                 "OpenMic",
-                "Continua rodando na bandeja. Clique no ícone para abrir de novo.",
+                tr("tray_minimized"),
                 QSystemTrayIcon.MessageIcon.Information,
                 3000,
             )
@@ -545,7 +445,7 @@ class MainWindow(QWidget):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    _install_launcher_entry()
+    desktop_entry.install_launcher_entry()
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

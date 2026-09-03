@@ -35,6 +35,18 @@ OPUS_BITRATE = 24000          # 24 kbps - voice quality, ~10x smaller than PCM
 OPUS_FRAME_SIZE_MS = 20       # 20ms frames
 OPUS_FRAME_SAMPLES = SAMPLE_RATE * OPUS_FRAME_SIZE_MS // 1000  # 960 samples per frame
 
+# Selectable quality presets. Only the encoder (phone) needs to know the
+# bitrate — an Opus frame carries its own configuration, so the desktop
+# decoder handles any of these without being told which one is in use.
+OPUS_BITRATE_MIN = 12000      # intelligible speech on a congested network
+OPUS_BITRATE_MAX = 64000      # near-transparent voice, ~2.7x the default
+OPUS_BITRATE_PRESETS = (16000, 24000, 48000)
+
+
+def clamp_bitrate(value: int) -> int:
+    """Keep a requested bitrate inside the range libopus handles for voice."""
+    return max(OPUS_BITRATE_MIN, min(OPUS_BITRATE_MAX, int(value)))
+
 DEVICE_ID_LEN = 16
 AUTH_TOKEN_LEN = 16
 PIN_LEN = 6  # digits

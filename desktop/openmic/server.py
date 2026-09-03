@@ -9,14 +9,28 @@ import time as _time
 from typing import Callable, Optional
 
 import numpy as np
-import sounddevice as sd
+
+from .native_libs import library_fallback
+
+# sounddevice locates libportaudio through find_library() at import time, so
+# the bundled copy has to be visible for that call or a frozen build only
+# works on hosts that happen to have PortAudio installed system-wide.
+with library_fallback("portaudio"):
+    import sounddevice as sd
 
 from . import protocol
+from .jitter_buffer import JitterBuffer
 from .noise_suppression import NoiseSuppressor
 from .opus_codec import OpusDecoder, _OPUS_AVAILABLE
 from .pairing import PairingStore, verify_pairing
+from .stream_stats import StreamSnapshot, StreamStatsCollector
 
 _log = logging.getLogger(__name__)
+
+# How long an address stays cleared to send audio after its last packet. Long
+# enough to survive a brief WiFi stall, short enough that a released DHCP
+# lease can't be inherited mid-call.
+AUDIO_SOURCE_TTL = 60.0
 
 
 class AudioBridge:
@@ -37,6 +51,12 @@ class AudioBridge:
         self._fragment = b""
         self._fragment_lock = threading.Lock()
         self._packet_count = 0
+        # Ordering/loss handling lives in front of the decoder: UDP delivers
+        # frames out of order and drops them, and both are audible if fed
+        # straight through in arrival order.
+        self._jitter = JitterBuffer()
+        self._stream_stats = StreamStatsCollector(frame_ms=protocol.OPUS_FRAME_SIZE_MS)
+        self._last_pcm_frame_len = protocol.OPUS_FRAME_SAMPLES * protocol.SAMPLE_WIDTH
 
     def start_output(self) -> None:
         # PortAudio caches its device list at init time, so a sink created after this
@@ -81,7 +101,50 @@ class AudioBridge:
         self._noise_suppressor.enabled = value
         _log.debug("Noise suppression %s", "enabled" if value else "disabled")
 
-    def push_audio(self, pcm: bytes) -> None:
+    def stats(self) -> StreamSnapshot:
+        """Current stream quality. Called from the UI thread once a second."""
+        jitter_stats = self._jitter.stats
+        return self._stream_stats.snapshot(
+            lost=jitter_stats.lost,
+            duplicates=jitter_stats.duplicates,
+            reordered=jitter_stats.reordered,
+            loss_percent=jitter_stats.loss_percent,
+            buffer_ms=self._jitter.pending * protocol.OPUS_FRAME_SIZE_MS,
+        )
+
+    def push_pcm(self, sequence: int, pcm: bytes) -> None:
+        """Queue a raw PCM16 frame (legacy path, no codec involved)."""
+        if pcm:
+            self._last_pcm_frame_len = len(pcm)
+        self._stream_stats.record_packet(len(pcm))
+        for frame in self._jitter.push(sequence, pcm):
+            # Nothing to reconstruct from without a codec, so a lost frame is
+            # silence — still better than shifting every later frame earlier.
+            self._play(frame if frame is not None else b"\x00" * self._last_pcm_frame_len)
+
+    def push_opus(self, sequence: int, opus_data: bytes) -> None:
+        """Decode one Opus frame (in sequence order) into the playout queue."""
+        if self._opus_decoder is None:
+            _log.debug("Opus frame received but decoder unavailable")
+            return
+        self._stream_stats.record_packet(len(opus_data))
+        for frame in self._jitter.push(sequence, opus_data):
+            try:
+                pcm = (
+                    self._opus_decoder.decode(frame)
+                    if frame is not None
+                    else self._opus_decoder.decode_lost()
+                )
+            except Exception:
+                # A corrupt/hostile Opus frame raises an opuslib exception. Drop
+                # the frame instead of letting it escape to asyncio and spam the
+                # log.
+                _log.debug("Dropping undecodable Opus frame")
+                continue
+            if pcm is not None:
+                self._play(pcm)
+
+    def _play(self, pcm: bytes) -> None:
         # Runs in packet-arrival order (single asyncio loop thread), which is
         # what the suppressor's overlap-add state requires — never call this
         # concurrently from more than one thread.
@@ -98,21 +161,6 @@ class AudioBridge:
         except queue.Full:
             pass  # falling behind: drop this chunk rather than build up latency
 
-    def push_opus(self, opus_data: bytes) -> None:
-        """Decode Opus frame and feed resulting PCM into the queue."""
-        if self._opus_decoder is None:
-            _log.debug("Opus frame received but decoder unavailable")
-            return
-        try:
-            pcm = self._opus_decoder.decode(opus_data)
-        except Exception:
-            # A corrupt/hostile Opus frame raises an opuslib exception. Drop the
-            # frame instead of letting it escape to asyncio and spam the log.
-            _log.debug("Dropping undecodable Opus frame (%d bytes)", len(opus_data))
-            return
-        if pcm is not None:
-            self.push_audio(pcm)
-
     def stop_output(self) -> None:
         if self._stream is not None:
             self._stream.stop()
@@ -121,6 +169,8 @@ class AudioBridge:
         with self._fragment_lock:
             self._fragment = b""
         self._noise_suppressor.reset()
+        self._jitter.reset()
+        self._stream_stats.reset()
 
     def _apply_gain(self, data: bytes) -> bytes:
         """Apply gain to int16 PCM data. Returns new bytes."""
@@ -178,15 +228,22 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         on_hello: Optional[Callable[[tuple, str, int, bytes, bytes], None]],
         on_bye: Optional[Callable[[tuple], None]],
         on_pairing_request: Optional[Callable[[tuple, str], None]],
+        store: Optional[PairingStore] = None,
     ):
         self._bridge = bridge
         self._on_hello = on_hello
         self._on_bye = on_bye
         self._on_pairing_request = on_pairing_request
         self.transport = None
-        self._store = PairingStore()
+        self._store = store if store is not None else PairingStore()
         self._pending_pairing: dict = {}  # addr -> {"pin": str, "device_name": str, "ts": float}
         self._pair_ttl = 60.0  # seconds a challenge stays valid before expiring
+        # Addresses cleared to send audio, with the time we last heard from
+        # them. Pairing only authenticates HELLO; without this table any host
+        # on the LAN could push audio straight into the virtual microphone by
+        # sending an AUDIO datagram to the port, no credentials involved.
+        self._audio_sources: dict[tuple, float] = {}
+        self._unauthorized_audio = 0
 
     def connection_made(self, transport):
         self.transport = transport
@@ -201,12 +258,15 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
             if packet_type == protocol.HELLO:
                 self._handle_hello(addr, payload)
             elif packet_type == protocol.AUDIO:
-                _, pcm = payload
-                self._bridge.push_audio(pcm)
+                sequence, pcm = payload
+                if self._accept_audio_from(addr):
+                    self._bridge.push_pcm(sequence, pcm)
             elif packet_type == protocol.AUDIO_OPUS:
-                _, opus_data = payload
-                self._bridge.push_opus(opus_data)
+                sequence, opus_data = payload
+                if self._accept_audio_from(addr):
+                    self._bridge.push_opus(sequence, opus_data)
             elif packet_type == protocol.BYE:
+                self._audio_sources.pop(addr, None)
                 if self._on_bye:
                     self._on_bye(addr)
             elif packet_type == protocol.PAIR_RESP:
@@ -223,6 +283,34 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
             _log.debug("Dropping malformed datagram from %s: %s", addr, exc)
             return
 
+    def _accept_audio_from(self, addr) -> bool:
+        """Whether this address completed a HELLO/pairing handshake recently.
+
+        Phones re-bind to a new source port on every reconnect (and DHCP can
+        move them to a new IP), so entries expire instead of living forever —
+        a stale one would keep accepting audio from whatever now holds that
+        address.
+        """
+        last_seen = self._audio_sources.get(addr)
+        now = _time.monotonic()
+        if last_seen is None or last_seen + AUDIO_SOURCE_TTL < now:
+            self._audio_sources.pop(addr, None)
+            self._unauthorized_audio += 1
+            # One line per burst, not per packet: an unauthorized sender
+            # streaming 50 packets a second would otherwise flood the log.
+            if self._unauthorized_audio % 100 == 1:
+                _log.warning(
+                    "Ignoring audio from unauthenticated source %s (%d dropped so far)",
+                    addr[0],
+                    self._unauthorized_audio,
+                )
+            return False
+        self._audio_sources[addr] = now
+        return True
+
+    def _authorize_audio_source(self, addr) -> None:
+        self._audio_sources[addr] = _time.monotonic()
+
     def _handle_hello(self, addr, payload) -> None:
         # payload is (version, device_id, auth_token, name)
         version, device_id, auth_token, name = payload
@@ -232,6 +320,7 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
             if verify_pairing(device_id, auth_token, self._store):
                 stored_name = self._store.get_name(device_id) or name
                 _log.info("Trusted device connected: %s (%s)", stored_name, addr[0])
+                self._authorize_audio_source(addr)
                 if self._on_hello:
                     self._on_hello(addr, stored_name, version, device_id, auth_token)
                 # Reply so the phone's connect handshake resolves. pack_hello has
@@ -288,6 +377,7 @@ class _MicServerProtocol(asyncio.DatagramProtocol):
         # Send ACK with credentials
         ack = protocol.pack_pair_ack(device_id, auth_token)
         self.transport.sendto(ack, addr)
+        self._authorize_audio_source(addr)
         _log.info("Device paired successfully: %s (%s)", pending["device_name"], addr[0])
 
         # Notify UI
@@ -302,10 +392,11 @@ async def run_server(
     on_hello: Optional[Callable[[tuple, str, int, bytes, bytes], None]] = None,
     on_bye: Optional[Callable[[tuple], None]] = None,
     on_pairing_request: Optional[Callable[[tuple, str], None]] = None,
+    store: Optional[PairingStore] = None,
 ):
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: _MicServerProtocol(bridge, on_hello, on_bye, on_pairing_request),
+        lambda: _MicServerProtocol(bridge, on_hello, on_bye, on_pairing_request, store),
         local_addr=(host, port),
     )
     return transport
